@@ -140,6 +140,7 @@ from contextlib import nullcontext
 from utils.dc import PiscesLxLogger, PiscesLxSystemMonitor
 
 from .config import PiscesLxTrainingConfig
+from .state_geometry import PiscesLxStateGeometryGate, PiscesLxStateGeometryError
 
 from utils.device import PiscesLxDeviceResolver
 from utils.host_memory import (
@@ -842,11 +843,16 @@ class PiscesLxTrainingOperator(object):
                         self._apply_quantization_gpu_accelerated() if self.device.type == "cuda" else self._apply_quantization()
                     self._apply_lora()
                     model_sd = self.model.state_dict()
-                    cache_keys = list(cached_state.keys())
-                    for k in cache_keys:
-                        if k in model_sd and cached_state[k].shape != model_sd[k].shape:
-                            _LOG.debug(f"Cache shape mismatch for {k}: cached {cached_state[k].shape} vs model {model_sd[k].shape}, skipping")
-                            del cached_state[k]
+                    # A cache is a snapshot of one geometry. The previous behaviour deleted
+                    # every cached tensor whose shape differed and loaded the rest, so a cache
+                    # written by another tier trained a half-fresh network behind a green
+                    # "initialized from cache" line (docs/audit/00 §78). Shapes are now a
+                    # whole-cache refusal; the surrounding handler drops the cache and falls
+                    # back to a real initialisation.
+                    PiscesLxStateGeometryGate.require_restorable(
+                        self.model, cached_state, f"QLoRA cache {cache_path}")
+                    # LoRA renaming legitimately changes the key set, so presence stays with
+                    # the engine's own non-strict load and is reported, not silently eaten.
                     missing, unexpected = self.model.load_state_dict(cached_state, strict=False)
                     if missing:
                         sample = ", ".join(missing[:8])
@@ -3082,6 +3088,9 @@ class PiscesLxTrainingOperator(object):
             state = adapter
         self._materialize_model_components()
         self._apply_component_record(checkpoint.get('materialized_components'))
+        # The strict load below would answer a wrong-tier checkpoint with one line per
+        # tensor. Refuse once, naming the geometry, and keep strict=True as the key-set check.
+        PiscesLxStateGeometryGate.require_restorable(self.model, state, f"checkpoint {filepath}")
         self.model.load_state_dict(state, strict=True)
         
         # Load optimizer state

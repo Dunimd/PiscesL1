@@ -95,6 +95,7 @@ from utils.dc import PiscesLxLogger
 
 from .config import PiscesLxTrainingConfig
 from .core import PiscesLxTrainingOperator
+from .state_geometry import PiscesLxStateGeometryGate
 from tools.data.dataset.raw_text import (
     PiscesLxToolsDataJsonSampleReader,
     PiscesLxToolsDataTextCollator,
@@ -1303,6 +1304,9 @@ class PiscesLxTrainOrchestrator(PiscesLxBaseOperator):
             else:
                 sd = raw
             if isinstance(sd, dict):
+                # Same contract as the trainer's resume path: a checkpoint written by another
+                # geometry must not half-load into a freshly built model (docs/audit/00 §78).
+                PiscesLxStateGeometryGate.require_restorable(model, sd, f"checkpoint {ckpt_path}")
                 model.load_state_dict(sd, strict=False)
         except Exception as e:
             return {"status": "error", "reason": f"ckpt_load_failed:{e}"}
@@ -1440,6 +1444,9 @@ class PiscesLxTrainOrchestrator(PiscesLxBaseOperator):
             else:
                 sd = raw
             if isinstance(sd, dict):
+                # Same contract as the trainer's resume path: a checkpoint written by another
+                # geometry must not half-load into a freshly built model (docs/audit/00 §78).
+                PiscesLxStateGeometryGate.require_restorable(model, sd, f"checkpoint {ckpt_path}")
                 model.load_state_dict(sd, strict=False)
         except Exception as e:
             return {"status": "error", "reason": f"ckpt_load_failed:{e}"}
