@@ -3374,3 +3374,38 @@ _signature/_layer_idx`；`_routing_head_warmup_steps=150 ≤ current_step=999`�
 **方法论（第四次同类错误换来的一条硬规则）**：断言"某机制不生效"之前，必须先穷举并钉住
 **同一子系统中的所有缓存/门控/自适应宽度**，否则测的是自己的探针。
 具体三条已在 §102/§103 落实为可复制的对照条件。
+
+### §104｜M4 起步：工具调用轨迹语料生成器，数据与运行时**共用一个方言**
+
+阶段 4 要求自建数据覆盖"预训练/指令/推理/工具调用轨迹"，而本机只有纯文本语料。本轮把已有的
+gsm8k 变成**工具调用监督数据**，并顺手修掉一个使这份语料此前不可用的缺陷。
+
+**修的缺陷（A97）**：`PiscesLxToolsDataJsonSampleReader.extract_text` 只认
+`text|content` 与 `instruction|output`，而 gsm8k 是 `question|answer` ⇒ 落到兜底分支
+`json.dumps(item)`：**模型会被喂成 `{"question": ..., "answer": ...}` 的引号噪音**。
+现改为按声明的 `INSTRUCTION_PAIRS` 别名表识别 `question/answer`、`prompt/completion`、
+`problem/solution`、`user/assistant`，并**删掉被取代的旧常量 `INSTRUCTION_FIELDS`**（不留冗余）。
+实测：同一行 gsm8k 现在读出正文首句，不再是 JSON 引号。
+
+**新增生成器**：`tools/data/tool_trace.py::PiscesLxToolTraceDatasetBuilder`（+ CLI 类）。
+关键点：
+- **序列化复用运行时那一个 codec**（`YvToolCallCodec.render` / `render_result`），
+  所以数据里的调用形状与模型将来要产出、运行时将来要解析的**完全同一来源**；
+  再写一套手写格式就是本次刚从运行时删掉的"两种方言"错误。
+- 只收录**能被本机重算验证**的算式步骤（`a op b = c`，四则运算自实现，**不用 `eval`/`exec`**，
+  不接受源文本可诱导执行的任何形式）；声明结果与重算不符的步骤被丢弃。
+- 每份文档 = 问题 + 未被算式覆盖的推理文字 + 逐步骤的
+  `调用工具：{"tool_calls":[...]}` / `工具返回：{"type":"tool_result",...}` + `结论：#### N`。
+
+**实测**：`data/corpus/gsm8k__main_train-*.jsonl` → `data/corpus_tools/gsm8k_tool_trace.jsonl`
+**written=3000 / skipped=151**（无可验算步骤）；平均**每文档 5.55 次工具调用**；
+把 3000 份文档回灌给**运行时解析器**：解析出 **16,648 个工具调用、解析报错 0**。
+训练管线端到端可用：`Loaded 3000 samples from path: data/corpus_tools`、真实反向、
+`REAL_EXIT=0`、`Training completed`（首步 loss 16.01 属新域名的正常起点，不当作指标）。
+
+**M4 还欠的（继续按此口径推进，不假装完成）**：
+① image/audio/video 三模态语料仍完全缺失，需自主下载与清洗（这是评测项 MMMU/MMBench/
+   TextVQA 等的前提）；② 指令/对齐语料只有这一份合成工具轨迹，需要真实多轮指令数据；
+③ `#### N` 记号是数据格式而非特殊 token，推理 span 的 `thinking` 监督仍未生成；
+④ 新窗口的 CE/负载尚未纳入曲线判定（§96 的三点均值规则）。
+门状态：`manage.py test --stage 10` 19 套全绿；`tools/check` 见本次提交记录。

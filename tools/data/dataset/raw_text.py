@@ -74,7 +74,17 @@ class PiscesLxToolsDataJsonSampleReader:
     KAGGLE_PREFIX = "kaggle://"
     JSON_SUFFIXES = (".jsonl", ".json")
     TEXT_FIELDS = ("text", "content")
-    INSTRUCTION_FIELDS = ("instruction", "output")
+    #: Instruction/answer pairs are published under several schema names. Without these aliases
+    #: a gsm8k-style row fell through to `json.dumps(item)` and trained on the quoting of
+    #: `{"question": ..., "answer": ...}` instead of on the text itself (docs/audit/00 §104).
+    #: This tuple replaces the older `INSTRUCTION_FIELDS` constant, which is now gone.
+    INSTRUCTION_PAIRS = (
+        ("instruction", "output"),
+        ("question", "answer"),
+        ("prompt", "completion"),
+        ("problem", "solution"),
+        ("user", "assistant"),
+    )
     HTML_SIGNATURES = (b"<!doctype html", b"<html")
     GZIP_MAGIC = b"\x1f\x8b"
     DIAGNOSTIC_BYTES = 200
@@ -92,6 +102,10 @@ class PiscesLxToolsDataJsonSampleReader:
         output = item.get("output", "")
         if instruction or output:
             return instruction + "\n" + output
+        for ask_key, answer_key in PiscesLxToolsDataJsonSampleReader.INSTRUCTION_PAIRS:
+            ask, answer = item.get(ask_key), item.get(answer_key)
+            if ask and answer:
+                return f"{ask}\n{answer}"
         return json.dumps(item, ensure_ascii=False)
 
     @classmethod
