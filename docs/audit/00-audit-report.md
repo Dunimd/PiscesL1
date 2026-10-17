@@ -3595,3 +3595,44 @@ codec 的结果形状回灌——照 §"文档形状与运行时解析同源"的
 本轮**不改这批源码**：整段替换需先读全 `:843` 之后的收尾分支再一次性落地，
 剩余窗口不足以同时完成改动与验证，宁可留精确取证也不交一个未验证的推理服务改动。
 
+## §110｜按 §108 动手改 A98，被实测拦下并已回退；换来比 §108 更硬的三条前置事实
+
+按 §108 口径落了四处改动（`initialize_reasoning_tokens` 改经真 tokenizer 解析、`unified.py` 不再用
+掩码冒充 token id、`model.py` 惰性初始化时传入 tokenizer、训练期带 labels 时物化引擎且仅在命中
+span 时前向），端到端探针把其中两处拦下，已全部 `git checkout` 回退（`git status` 干净；自检确认
+`convert_tokens_to_ids` 版本恢复、`has_reasoning_span` 不存在）。源码净变化为零，但探针换来三条
+硬事实，把 A98 从"改四个调用点"重定性为"先补两处一致性"：
+
+1. **`YvModel` 根本没有 `tokenizer` 属性**：实测 `hasattr(YvModel, 'tokenizer')` 为 **False**。
+   所以 `model.py:1327` 传 `None` 不是"忘了传"，而是**模型侧无处可取**——§108 第 1 点必须升级为
+   "标记绑定通路整体缺失"。修 A98 的第一步是决定 tokenizer 如何进入模型（训练器注入，
+   还是引擎自行取项目分词器），否则任何绑定写法都只会拿到 `None` 并退回词表尾部整数。
+2. **标记文本有两个互相分家的事实来源**：`model/tokenizer/special_tokens.py:198-199` 声明的起止标记
+   是**缺闭合角括号**的形态，而 `tokenizer/tokenizer.json` 的 `added_tokens` 实际注册的是
+   带闭合角括号的 think 起止标记（外加一个 `/nothink`），两边不是同一个串。
+   实测把**声明值**直接喂 `YvTokenizer.encode` 得到的是**两个** id（开标记 → `[13699, 766]`，
+   闭标记 → `[522, 26779]`），即声明串在词表里根本不是单个词元。
+   结论：**"标记串 → 取一个 id"这条路不成立**，必须先在 `added_tokens` 里按精确串查 id，
+   并把 `YvSpecialTokens` 与词表的串对齐成单一来源。这与 §108 里"README 声称的
+   `start_hypothesis` 一族不在词表"是同一病症，且这次的错形是**差一个右角括号**——人眼极易放过，
+   只有实测"encode 成几个 id"才能暴露。
+3. **`model/reasoning/reasoner/multipath_core.py` 没有模块级 `_LOG` 名字**：在该文件写日志直接
+   `NameError: name '_LOG' is not defined`（探针栈 `multipath_core.py:356`）。
+   该模块的日志句柄名必须先钉住，否则"报告标记解析失败"这件事自己会先崩——
+   而它正是本条通路最需要说话的地方。
+
+**A98 的正确执行顺序（下一轮按此做，勿再从第 4 步起跳）**：
+(a) 对齐 `YvSpecialTokens` 与 `tokenizer.json` 的 `added_tokens` 串，并加机检（两侧逐串比对、
+不一致即失败，阳性对照用一处故意改坏的声明）；
+(b) 引擎按**精确串查表**解析 id，查不到就显式日志并保持"不可监督"，不再用词表尾部整数冒充标记；
+(c) 打通 tokenizer 到模型的绑定通路（因第 1 条必须先定方案）；
+(d) `unified.py:424-427` 改回真 `input_ids`；
+(e) 训练期由"批次是否含标记"驱动引擎前向；
+(f) 数据侧按对齐后的标记产出 span（沿用 `tool_trace.py:75-83` 的"文档形状与运行时同源"先例）；
+(g) 契约测试判据：**同一份文档**过模型，断言 `thinking_head` 的 `.grad is not None`
+且 `_create_reasoning_masks` 返回的 span 非空；今天 `test_reasoner_shapes.py:127` 还在**期望**
+没有流内 CE，接入时须一并翻转该期望，否则测试会把修好的一方判为回归。
+
+**记账**：`thinking_head` 那 44% 参数继续无梯度；§108 的判定按本节三条事实更新；
+A94（服务侧仍按 XML）与 A98 均在册未修；回退后 stage-10 复跑结果见提交信息。
+
