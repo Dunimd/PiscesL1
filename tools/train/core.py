@@ -428,6 +428,14 @@ class PiscesLxTrainingOperator(object):
             _LOG.warning(f"Failed to initialize modality scheduler: {e}")
         
         try:
+            # Print the declaration the initialiser is about to act on. Every defect of this
+            # family (A23/A25/A87) was "the stage file says X, the engine did Y", and none of
+            # them could be closed from the log because the engine never stated what it read.
+            _LOG.info(
+                "Advanced operator declarations read by this trainer: "
+                f"moe_gradient={getattr(self.config, 'moe_gradient', None)}, "
+                f"kfac={getattr(self.config, 'kfac', None)}, "
+                f"multitask={getattr(self.config, 'multitask', None)}")
             if hasattr(self.config, 'moe_gradient') and self.config.moe_gradient.get('enabled', False):
                 # Filter out 'enabled' field before creating config
                 moe_config_dict = {k: v for k, v in self.config.moe_gradient.items() if k != 'enabled'}

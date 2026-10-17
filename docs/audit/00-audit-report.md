@@ -2683,3 +2683,28 @@ seq 128 的第二个窗口**继续下降** —— 同一条链上唯一变量是
 
 **边界（写死在代码注释里）**：这是**本机档可测性**的修复，不是旗舰日程的结论；
 `CPU_SCHEDULE_DOWNSHIFT_STEPS` 与 notes 都标 TEMPORARY，跑到非主机绑定档时必须复审。
+
+### §81｜A87 登记（未修）：`advanced_operators` 声明为关、引擎读到开（附复现）
+
+**证据（同一进程、两步迷你窗口，2026-10-17）**：stage 文件写
+`advanced_operators: {moe_gradient: {enabled: false}, kfac: {enabled: false}, multitask: {enabled: false}}`，
+而新加的对照日志打出：
+`Advanced operator declarations read by this trainer: moe_gradient={'enabled': True}, kfac={'enabled': True}, multitask={'enabled': True}`
+随后每步执行 `MoE gradient optimization complete: expert_params=26`。
+同一文件里的 `training.max_steps` **是**生效的（两步即停），所以不是"文件没读"。
+
+**已排除的两条猜测**（都是实测，不是推演）：
+① `PiscesLxTrainingConfig.load_from_yaml(<该文件>)` 直接测得 `{'enabled': False}` ⇒ **配置类自身没问题**；
+② 在 `load_stage_config`（内置档预设的重载点）前后打点，**该函数一次都没被调用** ⇒ 不是预设覆盖。
+
+**因此覆写发生在 `run()` 取得 `train_config` 之后、构造 trainer 之前**，范围已收窄到
+`orchestrator.run` 的 `apply_cli_overrides(...)` 与 `_apply_flagship_memory_and_convergence_policy(...)`
+两处（尚未定位）。**这是本仓同一类缺陷的第四次**（A23 喂错旗标静默半忽略、A25 声明未落地、
+A78 手写清单漏字段）：**声明与实际不符，只能靠"机制自己打出的读数"发现**，
+所以我把它变成了常驻日志行（保留在 `tools/train/core.py`，不是临时探针）。
+
+**为什么必须修**：`PiscesLxMoEGradientOperator` 对同一计算图做**第二次 backward**
+（§13 早已记录，主机档因此声明关闭）。A86 把辅助路由头接通后，这条二次反向在 seq128 链上
+**真的炸了**：`RuntimeError: Trying to backward through the graph a second time`
+（win9，约第 12 个 batch；日志与回溯在 `E:/pisceslx-artifacts/win9.log`）。
+也就是说：一个声明为关的算子被静默启用，且它现在会**终止训练**。
