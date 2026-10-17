@@ -457,12 +457,17 @@ class YvMoEGate(nn.Module):
 
         # === Step 11: PathMoE cache ===
         if self._path_moe_stage_size > 1:
-            # Sharing one assignment across a stage is the point of PathMoE, but the
-            # cached rows are only meaningful for the input they were routed from: a new
-            # batch (or a phase change) with a different token count must re-route,
-            # otherwise the following layers dispatch a stale row count against their
-            # own tokens.
-            signature = (x_flat.size(0), self.training)
+            # Sharing one assignment across a stage is the point of PathMoE, but this object is
+            # one gate of one layer: it is entered exactly once per forward pass, so keying a
+            # cache on `(token count, training)` cannot share anything between layers - it
+            # replays the assignment computed for an *earlier batch* for the next
+            # `stage_size - 1` passes, which under a fixed batch/seq shape is nearly always
+            # (docs/audit/00 §102: this is what made auxiliary-head changes invisible in the
+            # router output). The cache is therefore now an input-identity memo: a different
+            # input must re-route. Genuine stage-level sharing needs a pass-scoped context
+            # carried through the forward call, which is registered as an open defect.
+            signature = (x_flat.size(0), self.training,
+                         float(x_flat.norm()), float(x_flat.sum()))
             if signature != self._path_moe_signature:
                 self._path_moe_layer_idx = 0
                 self._path_moe_cache = None
