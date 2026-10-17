@@ -555,7 +555,21 @@ class PiscesLxTrainOrchestrator(PiscesLxBaseOperator):
             except Exception:
                 pass
 
-        if "advanced_operators" in model_train_cfg:
+        # Precedence: an explicitly named `--train_config` stage file outranks the model
+        # config's own `training_config` block for the advanced-operator switches. Without this
+        # the model file re-asserted `enabled: true` in place, so a stage file declaring
+        # `moe_gradient: {enabled: false}` was ignored and the operator ran anyway - the same
+        # "derived default silently wins back" bug already guarded one section above
+        # (docs/audit/00 §81, defect A87).
+        if self._explicit_train_config and (
+                "advanced_operators" in model_train_cfg
+                or any(key in model_train_cfg for key in self.ADVANCED_OPERATOR_KEYS)):
+            _LOG.info(
+                "Advanced-operator switches kept from the explicit stage file "
+                f"(model config offered {'advanced_operators' in model_train_cfg}): "
+                f"moe_gradient={self.train_config.moe_gradient}, "
+                f"kfac={self.train_config.kfac}, multitask={self.train_config.multitask}")
+        elif "advanced_operators" in model_train_cfg:
             adv = model_train_cfg["advanced_operators"]
             if "moe_gradient" in adv:
                 self.train_config.moe_gradient = adv["moe_gradient"]
@@ -566,17 +580,24 @@ class PiscesLxTrainOrchestrator(PiscesLxBaseOperator):
             if "modality_scheduler" in adv:
                 self.train_config.modality_scheduler = adv["modality_scheduler"]
 
-        if "moe_gradient" in model_train_cfg:
-            self.train_config.moe_gradient = model_train_cfg["moe_gradient"]
-        if "kfac" in model_train_cfg:
-            self.train_config.kfac = model_train_cfg["kfac"]
-        if "multitask" in model_train_cfg:
-            self.train_config.multitask = model_train_cfg["multitask"]
-        if "modality_scheduler" in model_train_cfg:
-            self.train_config.modality_scheduler = model_train_cfg["modality_scheduler"]
+        if not self._explicit_train_config:
+            if "moe_gradient" in model_train_cfg:
+                self.train_config.moe_gradient = model_train_cfg["moe_gradient"]
+            if "kfac" in model_train_cfg:
+                self.train_config.kfac = model_train_cfg["kfac"]
+            if "multitask" in model_train_cfg:
+                self.train_config.multitask = model_train_cfg["multitask"]
+            if "modality_scheduler" in model_train_cfg:
+                self.train_config.modality_scheduler = model_train_cfg["modality_scheduler"]
 
     # Stages that fit an existing base model: memory policies (4-bit base + adapters)
     # apply here. Pretraining has no base to adapt — its trunk weights are the product.
+    #: Flat keys under which a model config may offer the advanced-operator switches, in either
+    #: spelling (`advanced_operators:` section or one top-level dict per operator).
+    ADVANCED_OPERATOR_KEYS = frozenset({
+        "moe_gradient", "kfac", "multitask", "modality_scheduler",
+    })
+
     ADAPTER_STAGES = frozenset({
         "sft", "alignment_dpo", "alignment_ppo", "alignment_orpo", "specialized",
         "rl_grpo", "rl_rlvr", "rl_dapo",
@@ -894,6 +915,14 @@ class PiscesLxTrainOrchestrator(PiscesLxBaseOperator):
             # would otherwise both be applied and the derived one silently wins back.
             self._explicit_train_config = True
             self.train_config = self._load_config_from_file(train_cfg_path.strip())
+            # Statement of what the explicitly named stage file actually produced, so a later
+            # divergence at the trainer is attributable to a mutation or a replacement
+            # (docs/audit/00 §81, defect A87).
+            _LOG.info(
+                "Stage file applied: "
+                f"config=0x{id(self.train_config):x}, "
+                f"max_steps={getattr(self.train_config, 'max_steps', None)}, "
+                f"moe_gradient={self.train_config.moe_gradient}")
 
         train_mode = str(params.get("train_mode") or "standard").strip() or "standard"
         if train_mode == "standard" and params.get("rlhf"):

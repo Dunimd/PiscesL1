@@ -2708,3 +2708,47 @@ A78 手写清单漏字段）：**声明与实际不符，只能靠"机制自己�
 **真的炸了**：`RuntimeError: Trying to backward through the graph a second time`
 （win9，约第 12 个 batch；日志与回溯在 `E:/pisceslx-artifacts/win9.log`）。
 也就是说：一个声明为关的算子被静默启用，且它现在会**终止训练**。
+
+### §82｜A87 已修（源码）+ 一处我下错的归因，当场更正（2026-10-17）
+
+**修了什么**：`tools/train/orchestrator.py::_apply_model_training_config` 会把模型配置里的四个
+算子开关**就地写回** `train_config`（`moe_gradient/kfac/multitask/modality_scheduler`，
+`advanced_operators:` 段与扁平两种写法都支持），于是显式 `--train_config` 声明的 `false` 被
+模型配置默认值 `true` 覆盖。按仓内既有优先级口径（显式命名的 stage 文件胜过派生默认，
+同一段代码上一节已经这么处理过 stage 预设）收口：显式文件在场时**不覆写**，并打出保留结果。
+
+**前后对照（同一 2 步迷你窗口、同一进程）**
+| 读数 | 修复前 | 修复后 |
+|---|---|---|
+| 常驻声明日志 `moe_gradient` | `{'enabled': True}` | `{'enabled': False}` |
+| `MoE gradient optimization complete` 次数 | 每步 1 次 | **0 次** |
+| 配置对象 id | 0x…550 | 同 id 不变 ⇒ **是就地改写，不是整体替换**（这就是 loader 层查不出来的原因） |
+| `max_steps` | 202 | 202（未被覆写，佐证覆写范围只有那四个字典） |
+
+**契约**：`tools/test/test_operator_precedence_contract.py` **4/4**，含自我对照
+（把任一开关写入移到守卫之前必须判失败）。`tools/check` 4008 / 0 警告，无新增。
+
+**更正（重要）**：我在 §81 把 win9 的二次反向崩溃归因给"被静默启用的 MoE 梯度算子"。
+**该归因错了**：算子现在执行 **0 次**，seq128 链仍在**第 11 个 batch** 抛
+`RuntimeError: Trying to backward through the graph a second time`。
+修好的是声明-实际不符（A87 本身成立且必须修），但崩溃另有根因。
+
+**单变量证据（崩溃触发条件已锁定）**：同一条 seq128 链、同一优化器与语料，
+唯一差别是 A86 的降档 —— A86 之前辅助路由头不激活，**200 步跑完**；
+A86 之后头激活，**第 11 个 batch 崩**。所以触发条件是"辅助路由头进入计算图"，
+不是序列长、不是优化器、不是 MoE 梯度算子。
+
+**已排除的三条假设（都有实测）**：① MoE 梯度算子（0 次执行仍崩）；
+② 头路径自己反向（`model/moe/*.py` 里除 docstring 示例外没有 `.backward()`/`autograd.grad` 调用）；
+③ 门把上一步的图张量缓存到 `self` 再折进目标（`gate.py` 无以张量赋到 `self` 的语句）。
+
+**手段受限的记录**：`torch.autograd.set_detect_anomaly(True)` 在本机 CPU 上慢到
+**9 分钟走不到第 0 个 batch**（`exit=124`），拿不到"该图在哪创建"的栈，此路本机不可用。
+
+**下一步（具体）**：在 pipeline/trainer 侧查**一个 step 内是否对同一 loss 反向两次** ——
+A67/A72 早已记录训练器有两条**重算 loss** 的分支（response-mask / SFT-mask），
+那是同一 step 内第二次前向-反向的已知来源；判据是在那两条分支处打印 loss 张量的 `grad_fn` 与
+`retain_graph` 语义，让"第二次反向"自己现形，而不是再猜。
+
+**风险登记**：本机 seq128 链在此前向缺陷修好前**处于阻塞**；seq256 链 25 步可跑完（win8）。
+证据检查点未受影响（`keep_step200_seq128.pt`、`keep_step250_seq256_a86.pt` 均在 E 盘）。

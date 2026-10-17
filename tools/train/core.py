@@ -433,6 +433,8 @@ class PiscesLxTrainingOperator(object):
             # them could be closed from the log because the engine never stated what it read.
             _LOG.info(
                 "Advanced operator declarations read by this trainer: "
+                f"config=0x{id(self.config):x}, "
+                f"max_steps={getattr(self.config, 'max_steps', None)}, "
                 f"moe_gradient={getattr(self.config, 'moe_gradient', None)}, "
                 f"kfac={getattr(self.config, 'kfac', None)}, "
                 f"multitask={getattr(self.config, 'multitask', None)}")
