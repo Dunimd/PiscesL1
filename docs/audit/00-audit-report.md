@@ -3409,3 +3409,36 @@ gsm8k 变成**工具调用监督数据**，并顺手修掉一个使这份语料�
 ③ `#### N` 记号是数据格式而非特殊 token，推理 span 的 `thinking` 监督仍未生成；
 ④ 新窗口的 CE/负载尚未纳入曲线判定（§96 的三点均值规则）。
 门状态：`manage.py test --stage 10` 19 套全绿；`tools/check` 见本次提交记录。
+
+### §105｜A95：PathMoE 的层间共享第一次真正实现（模型本体改动）
+
+**问题**：`YvMoEGate` 的 stage 缓存在每个门上，而**每个门每次前向只被调用一次**——
+"一个 stage 共享一次分配"这种语义用每层私有状态**在原理上就无法表达**。
+§102 我把它退化成输入同一性 memo（正确但**共享功能仍未实现**）。本轮补上真正的实现。
+
+**做法**（`model/moe/gate.py` + `model/core/model.py`）：
+新增 `YvPathMoeStageContext`，由**模型持有**并注入每个门（照 `_is_checkpointing` 的注入先例；
+按"是否有 `_stage_context` 属性"匹配门，不按类匹配，因为栈里存在多种 gate 类型）。
+上下文用**到达计数**界定前向边界：门在层序上每 pass 各进一次，故
+`stage_index = arrivals_before // stage_size`，到达数满 `_gates_in_pass` 即视为进入新一次前向，
+清空分配并递增 `pass_id`。**不需要给 forward 加任何传参**，因此不触碰主干签名。
+未注入上下文时（裸门、单元测试）自动退回 §102 的输入同一性 memo。
+
+**实测（`configs/model/0.01B.yaml` 真模型）**
+| 判据 | 结果 |
+|---|---|
+| 注入门数 / 每 pass 门数 | 2 / 2 |
+| 第 1 次前向：`pass_id`, `arrivals`, stage 数 | 0, 2, **1** ⇒ stage0 内第二个门服从第一个门的分配 |
+| stage0 分配形状 | (10, 2)（token×top_k，与首门一致） |
+| 第 2 次前向（不同输入） | `pass_id=1`、分配重算 ⇒ **跨 batch 回放消除** |
+| 梯度 | 主干与门路径仍正常回流 |
+
+**真实档位验证**：`--model_size 0.1B`、seq256、从 `keep_step350_seq256.pt` 续 5 步
+（`win16_a95`）：**REAL_EXIT=0、零 Traceback、Batch0 loss 9.5398**（带内），
+`manage.py test --stage 10` **19 套全绿**、`tools/check` **4087 / 0 警告**（无新增）。
+
+**行为变更已声明**：这个改动会让同一 stage 的第 2..N 个门**改用首门的专家分配**（此前它们各自
+重算，或按 §102 之前那样复用到陈旧分配）。这是 PathMoE 的既定语义，但它**改变 dispatch**，
+因此曲线读数从此与 step≤350 的历史点**不可直接混比**：新链条的判据要从 355 之后重新起三点均值。
+本机档位只有 2 个 MoE 门 < `path_moe_stage_size=4` ⇒ 整个模型恰好一个 stage；
+更多层的档位才会出现多 stage，这一点在 7B 档实测前不声称已验证。

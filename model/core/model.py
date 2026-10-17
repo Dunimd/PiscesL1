@@ -945,6 +945,18 @@ class YvModel(nn.Module):
 
         total_params = sum(p.numel() for p in self.parameters())
         _LOG.debug(f"YvModel: total parameters = {total_params/1e6:.2f}M")
+        #: PathMoE stage sharing is per forward pass, so the holder lives on the model and is
+        #: injected into every gate; a per-gate cache cannot express it (docs/audit/00 §102).
+        #: Gates are matched by capability (`_stage_context`), not by class, because the stack
+        #: uses more than one gate type.
+        from ..moe.gate import YvPathMoeStageContext
+        self.path_moe_context = YvPathMoeStageContext()
+        _path_moe_gates = [module for module in self.modules()
+                           if hasattr(module, "_stage_context")]
+        for _gate in _path_moe_gates:
+            _gate._stage_context = self.path_moe_context
+        self.path_moe_context.register_gate_count(len(_path_moe_gates))
+
         _LOG.debug("YvModel: __init__ end")
 
     def reset_parameters(self):

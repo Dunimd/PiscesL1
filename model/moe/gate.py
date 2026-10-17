@@ -106,6 +106,60 @@ _RESONANCE_OFF = 0.0
 _RESONANCE_EPS = 1e-12
 
 
+class YvPathMoeStageContext(nn.Module):
+    """One routing assignment shared by the layers of a PathMoE stage within a forward pass.
+
+    PathMoE's premise is that a *stage* dispatches once: the gates of one pass must agree on
+    the same expert assignment. A per-gate cache cannot express that (each gate is entered
+    exactly once per pass), which is why the previous shape-keyed memo replayed an earlier
+    batch's assignment instead (docs/audit/00 §102). The context is therefore held by the
+    model and attached to every gate; it counts gate arrivals and treats a full round of them
+    as one pass, so no pass identifier has to be threaded through the forward signatures.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._assignments: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._arrivals = 0
+        self._gates_in_pass = 0
+        self.pass_id = 0
+
+    def register_gate_count(self, gate_count: int) -> None:
+        """Declare how many gates participate in one pass (set once at attach time)."""
+        self._gates_in_pass = max(int(gate_count), 0)
+
+    def _begin_new_pass(self) -> None:
+        self._assignments = {}
+        self._arrivals = 0
+        self.pass_id += 1
+
+    def stage_assignment(self, stage_size: int,
+                         top_scores: torch.Tensor,
+                         top_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the assignment this gate must dispatch with.
+
+        Gates are entered in layer order exactly once per pass, so the arrival counter *is*
+        the layer index within the pass: the first `stage_size` arrivals form stage 0, the
+        next `stage_size` form stage 1, and each stage obeys its first gate's assignment.
+
+        Args:
+            stage_size: How many layers share one assignment in this model.
+            top_scores: This gate's own freshly computed weights.
+            top_idx: This gate's own freshly computed expert indices.
+        """
+        stage_size = max(int(stage_size), 1)
+        if self._gates_in_pass and self._arrivals >= self._gates_in_pass:
+            self._begin_new_pass()
+        arrivals_before = self._arrivals
+        self._arrivals += 1
+        stage_index = arrivals_before // stage_size
+        existing = self._assignments.get(stage_index)
+        if existing is None:
+            self._assignments[stage_index] = (top_scores, top_idx)
+            return top_scores, top_idx
+        return existing
+
+
 class YvMoEGate(nn.Module):
     """Expert routing gate for MoE with top-k selection and load balancing.
     
@@ -281,6 +335,9 @@ class YvMoEGate(nn.Module):
         self._path_moe_layer_idx = 0
         self._path_moe_cache = None
         self._path_moe_signature = None
+        #: Set by the model: sharing an assignment across a stage needs a pass-scoped object,
+        #: not per-gate state (:class:`YvPathMoeStageContext`).
+        self._stage_context = None
 
         # GSA-style learnable sparse gates for routing mechanism cost optimization
         self.sparse_gate_hicl = nn.Parameter(torch.tensor(5.0, device=device, dtype=dtype))
@@ -457,26 +514,29 @@ class YvMoEGate(nn.Module):
 
         # === Step 11: PathMoE cache ===
         if self._path_moe_stage_size > 1:
-            # Sharing one assignment across a stage is the point of PathMoE, but this object is
-            # one gate of one layer: it is entered exactly once per forward pass, so keying a
-            # cache on `(token count, training)` cannot share anything between layers - it
-            # replays the assignment computed for an *earlier batch* for the next
-            # `stage_size - 1` passes, which under a fixed batch/seq shape is nearly always
-            # (docs/audit/00 §102: this is what made auxiliary-head changes invisible in the
-            # router output). The cache is therefore now an input-identity memo: a different
-            # input must re-route. Genuine stage-level sharing needs a pass-scoped context
-            # carried through the forward call, which is registered as an open defect.
-            signature = (x_flat.size(0), self.training,
-                         float(x_flat.norm()), float(x_flat.sum()))
-            if signature != self._path_moe_signature:
-                self._path_moe_layer_idx = 0
-                self._path_moe_cache = None
-                self._path_moe_signature = signature
-            if self._path_moe_layer_idx == 0 or self._path_moe_cache is None:
-                self._path_moe_cache = (top_scores, top_idx)
+            if self._stage_context is not None:
+                # Stage sharing is a property of one forward pass, so the model's context
+                # decides: the first gate of a stage dispatches, the rest of the stage obeys
+                # (docs/audit/00 §102/A95).
+                top_scores, top_idx = self._stage_context.stage_assignment(
+                    self._path_moe_stage_size, top_scores, top_idx)
             else:
-                top_scores, top_idx = self._path_moe_cache
-            self._path_moe_layer_idx = (self._path_moe_layer_idx + 1) % self._path_moe_stage_size
+                # Without a context (a bare gate in a unit test, or a model that never
+                # attached one) the cache can only be an input-identity memo: keying it on
+                # shape alone replayed a previous batch's routing for the next
+                # `stage_size - 1` passes.
+                signature = (x_flat.size(0), self.training,
+                             float(x_flat.norm()), float(x_flat.sum()))
+                if signature != self._path_moe_signature:
+                    self._path_moe_layer_idx = 0
+                    self._path_moe_cache = None
+                    self._path_moe_signature = signature
+                if self._path_moe_layer_idx == 0 or self._path_moe_cache is None:
+                    self._path_moe_cache = (top_scores, top_idx)
+                else:
+                    top_scores, top_idx = self._path_moe_cache
+                self._path_moe_layer_idx = (
+                    self._path_moe_layer_idx + 1) % self._path_moe_stage_size
 
         # === Step 12: State update ===
         if self.training and (not self._is_checkpointing):
