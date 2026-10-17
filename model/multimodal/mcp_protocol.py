@@ -311,6 +311,18 @@ class YvMCPUnifiedToolExecutor:
         """Process-wide executor used by callers that only need name resolution."""
         return cls()
 
+    def stats(self) -> Dict[str, Any]:
+        """Execution counters the manager records: the registry alone cannot answer them."""
+        return {
+            "executions": len(self._MANAGER.history()),
+            "failures": self._MANAGER.failure_count(),
+            "registered": self.registry.list_tools(),
+        }
+
+    def reset_stats(self) -> None:
+        """Forget recorded outcomes; registered tools stay."""
+        self._MANAGER.clear()
+
     def execute(self, tool_name: str, arguments: Optional[Dict[str, Any]] = None,
                 mode: str = YvExecutionMode.AUTO.value) -> YvMCPExecutionResult:
         """Invoke a registered tool and record the outcome."""

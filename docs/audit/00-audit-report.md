@@ -3074,3 +3074,49 @@ Tensor with more than one value is ambiguous`（batch=1 是 0-dim，能过，所
 我**没有**用字符串猜测去糊，只保证"不静默丢弃"；
 ② `mcp.py` 的 `get_execution_stats()/reset_execution_stats()` 仍调用注册器上不存在的
 `get_stats()`，是同类幽灵 API 的剩余点，未在本次路径上触发，**在册待修**。
+
+### §95｜M1 工具调用协议标准化（删 XML，不兼容）+ 度量口径修正（A93）
+
+**A. 协议：XML 方言整条删除，改为行业标准 JSON**
+新增 `model/multimodal/tool_call_codec.py::YvToolCallCodec`，一个解析/序列化点，接受三种主流形状：
+① `{"tool_calls":[{"type":"function","function":{"name","arguments"}}]}`（OpenAI/DeepSeek/Qwen，
+   `arguments` 允许是 JSON **字符串**，这正是这些 API 的序列化方式）；
+② `{"type":"tool_use","name","input"}`（Anthropic，含内容块数组）；③ 裸 `{"name","arguments"}`，
+可选 `"agent"` 字段做归属（多 agent 就是多个 call，**不需要 `<ag_group>` 标签**）。
+`model/multimodal/xml_utils.py`（492 行，`<agentic>/<ag>/<tool>/<tn>/<tp>/<ap1>` 与
+`YvParsedAgenticCall/YvAgenticGroup/YvXMLMode`）**删除且不留兼容层**——任何旗舰模型都不产出这些标记，
+要专门教给分词器才能生效，留着只会让两种拼写同时活着（违反"一次做好、不搞兼容"）。
+`agentic_protocol.py` 全文重写为 codec 的薄层：`process_model_output/get_pending_tool_calls/
+create_result_wrapper*` 一律产出**扁平 JSON**，不再有 XML 信封；`validate_call` 不再要求必须命名 agent
+（标准里 agent 归属是可选项，旧写法会把合法调用判为非法）。
+**"绝不静默丢调用"写进协议本身**：认得出是工具文档但结构坏 ⇒ 抛 `YvToolCallProtocolError`。
+
+**端到端实测（5 种形状 + 2 个负样本，真实执行 native 协程工具）**
+| 输入形状 | 调用数 | agent 归属 | 回灌结果 |
+|---|---|---|---|
+| OpenAI/DeepSeek/Qwen | 1 | `''` | `{'echo': {'text': 'A'}}` |
+| `arguments` 为 JSON 字符串 | 1 | `''` | `{'echo': {'text': 'B'}}` |
+| Anthropic `tool_use/input` | 1 | `''` | `{'echo': {'text': 'C'}}` |
+| 裸调用 + `agent` | 1 | `'planner'` | `{'echo': {'text': 'D'}}` |
+| 多工具 | 2 | — | `E1`、`E2` 两条都执行 |
+| `{"tool_calls": "不是列表"}` | — | — | **明确拒绝** `YvToolCallProtocolError` |
+| 散文里的 `{"a": 1}` | 0 | — | 不误触发（parsed=False） |
+
+同步清掉**指令书与 AGENTS.md 的方言表述**（`UPGRADE_03_ARCH.md` 3.3.1 与 `AGENTS.md` §3 现在直接给出
+JSON 形状并明写"不使用 XML 标签协议、不做兼容"），并按"承载误读处必须改"的教训更新模块 docstring。
+
+**登记在册（不展开，避免偏离主线）**：`tools/infer/agent_interceptor.py` 仍用 XML 标记做**注入检测**
+——检测可疑标记是防御职责可以保留，但它**看不见 JSON 形状的工具调用文档**，即标准切换后真正的注入面。
+待服务层加固批次处理（记为 A94）。
+
+**B. A93：`verify_checkpoint` 把参数与 buffer 分开计数（口径修正）**
+比对一直走 `state_dict()`，而 `state_dict()` 含 buffer；buffer 与新建模型逐位相同是**应当如此**。
+现拆成 `named_parameters()` / buffer 两栏并各自报告。**第一次诚实读数（step275）**：
+578 个张量 = **554 个参数 + 24 个 buffer**；`changed=528`、
+**未训练参数 26 个**（此前我按"未变 50/66"报的是混合口径，**夸大约一倍**）、buffer 未变 24 个（正常）。
+未训练参数样本里又见同类类型混淆：`got_graph_builder.affinity_threshold`、
+`graph_graph_builder.graph_scale`（正确名 `got_graph_builder.graph_scale`）是 `nn.Parameter`
+却当阈值/尺度使用，与 `expert_temperature_max` 一样属"声明为可训练、按常量使用"。
+后续所有"覆盖率"论述一律改用 `parameters_unchanged`。
+
+门状态：`manage.py test --stage 10` **19 套全绿**；`tools/check` **4087 / 0 警告**（删 XML 文件净减 5）。

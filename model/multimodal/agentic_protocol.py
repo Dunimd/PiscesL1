@@ -24,49 +24,54 @@
 from __future__ import annotations
 
 """
-Agentic Protocol Handler for PiscesLx Model-Agent Communication.
+Agentic protocol handler: JSON tool calls carried in the ordinary text stream.
 
-This module provides the core protocol handling for model-agent interactions,
-supporting the unified XML syntax defined in xml_utils.py.
+Tool calling is not a modality (docs/prompts/UPGRADE_03_ARCH.md 3.3.1, 禁令 #18). The model
+writes a JSON document into the text it generates, this protocol turns it into concrete tool
+calls, the executor runs them, and the artifact re-enters the model as text.
 
-Protocol Flow:
-    Model Output: "...<agentic><ag>code_expert</ag><tool><tn>execute</tn><tp>{}</tp></tool></agentic>..."
-                  ↓
-    xml_parser.extract_agentic_calls()
-                  ↓
-    YvAgenticProtocol.process_model_output()
-                  ↓
-    Execute via Agent Orchestrator or Tool Executor
-                  ↓
-    Return result wrapped in <result> XML tags
+Protocol flow:
+    model text:  ... {"tool_calls":[{"type":"function","function":{"name":"search",
+                 "arguments":{"query":"x"}}}]} ...
+        |  YvToolCallCodec.parse
+        v
+    process_model_output  ->  YvAgenticContext (agent groups)
+        |  get_pending_tool_calls
+        v
+    tool executor  ->  YvAgenticResult
+        |  create_result_wrapper (one flat JSON record, no tag envelope)
+        v
+    observation with modality="text" and metadata kind="tool_result"
 
-Key Components:
-    - YvAgenticProtocol: Main protocol handler
-    - YvAgenticContext: Execution context container
-    - YvAgenticResult: Standardized result container
+The XML marker dialect (`<agentic>/<ag>/<tool>/<tn>/<tp>`) this file used to drive is removed:
+no flagship model emits those tags, they had to be taught to a tokenizer to work at all, and a
+compatibility layer would keep both spellings alive at once (docs/audit/00 §95).
+
+Key components:
+    - YvAgenticProtocol: protocol handler over the codec
+    - YvAgenticContext: one parsed model output awaiting execution
+    - YvAgenticResult: standardized execution outcome
 
 See Also:
-    - model.multimodal.xml_utils: XML parsing utilities
+    - model.multimodal.tool_call_codec: the JSON dialect and its normalization rules
 """
 
-import json
 import time
 import uuid
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
-from .xml_utils import (
-    YvMCPXMLParser,
-    YvMCPXMLGenerator,
-    YvParsedAgenticCall,
-    YvAgenticToolCall,
+from .tool_call_codec import (
     YvAgenticAgentCall,
-    YvAgenticGroup,
+    YvToolCallBatch,
+    YvToolCallCodec,
 )
 
 
 class YvAgenticExecutionMode(Enum):
+    """How the calls inside one model output are to be run."""
+
     SINGLE = "single"
     SWARM = "swarm"
     SEQUENTIAL = "sequential"
@@ -74,17 +79,21 @@ class YvAgenticExecutionMode(Enum):
 
 @dataclass
 class YvAgenticContext:
+    """One parsed model output awaiting execution."""
+
     execution_id: str
     session_id: str
     mode: str
     start_time: float
-    agent_calls: List[YvParsedAgenticCall]
+    agent_calls: List[YvAgenticAgentCall]
     metadata: Dict[str, Any] = field(default_factory=dict)
     intermediate_results: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
 class YvAgenticResult:
+    """Standardized outcome of one tool execution."""
+
     success: bool
     output: Any
     execution_time: float
@@ -97,198 +106,162 @@ class YvAgenticResult:
 
 
 class YvAgenticProtocol:
-    def __init__(self):
-        self.parser = YvMCPXMLParser()
-        self.generator = YvMCPXMLGenerator()
+    """Turns model text into executable tool calls, and results back into model text."""
+
+    def __init__(self) -> None:
         self.contexts: Dict[str, YvAgenticContext] = {}
-    
+
+    @staticmethod
+    def _short_id() -> str:
+        """Compact identifier used for sessions and executions."""
+        return str(uuid.uuid4())[:8]
+
+    @staticmethod
+    def mode_for(batch: YvToolCallBatch) -> str:
+        """Derive the execution mode from the parsed shape; the standard carries no marker."""
+        if len(batch.calls) <= 1:
+            return YvAgenticExecutionMode.SINGLE.value
+        if len([group for group in batch.groups if group.agent_name]) > 1:
+            return YvAgenticExecutionMode.SWARM.value
+        return YvAgenticExecutionMode.SEQUENTIAL.value
+
     def process_model_output(
         self,
         model_output: str,
         session_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, Optional[YvAgenticContext]]:
-        agentic_calls = self.parser.extract_agentic_calls(model_output)
-        
-        if not agentic_calls:
+        """Parse one model output into a registered execution context.
+
+        Returns `(model_output, context)`, where `context` is None when the text asked for no
+        tool. A recognizable but malformed call document raises
+        `YvToolCallProtocolError`: a call is never dropped because parsing was awkward.
+        """
+        batch = YvToolCallCodec.parse(model_output)
+        if batch.is_empty:
             return model_output, None
-        
-        execution_id = str(uuid.uuid4())[:8]
-        session_id = session_id or str(uuid.uuid4())[:8]
-        start_time = time.time()
-        
-        if len(agentic_calls) == 1:
-            mode = agentic_calls[0].mode
-        else:
-            mode = "sequential"
-        
+
         context = YvAgenticContext(
-            execution_id=execution_id,
-            session_id=session_id,
-            mode=mode,
-            start_time=start_time,
-            agent_calls=agentic_calls,
-            metadata=metadata or {}
+            execution_id=self._short_id(),
+            session_id=session_id or self._short_id(),
+            mode=self.mode_for(batch),
+            start_time=time.time(),
+            agent_calls=[group for group in batch.groups if group.calls],
+            metadata=dict(metadata or {}),
         )
-        
-        self.contexts[execution_id] = context
-        
+        self.contexts[context.execution_id] = context
         return model_output, context
-    
+
+    @staticmethod
     def get_pending_tool_calls(
-        self,
-        context: YvAgenticContext
-    ) -> List[Tuple[YvAgenticAgentCall, List[YvAgenticToolCall]]]:
-        pending = []
-        
-        for call in context.agent_calls:
-            if call.agent_group:
-                for agent_name in call.agent_group.agents:
-                    agent_call = YvAgenticAgentCall(
-                        agent_name=agent_name,
-                        raw_match="",
-                        start_pos=0,
-                        end_pos=0
-                    )
-                    pending.append((agent_call, call.tools))
-                continue
+        context: YvAgenticContext,
+    ) -> List[Tuple[YvAgenticAgentCall, List[Any]]]:
+        """Return ``(agent group, its calls)`` pairs in the order the model emitted them."""
+        return [(group, list(group.calls)) for group in context.agent_calls if group.calls]
 
-            agents = list(call.agents)
-            if agents:
-                for agent in agents:
-                    pending.append((agent, call.tools))
-                continue
-
-            # A model that emitted a tool block without a resolvable agent must not have the
-            # call dropped in silence: the parse said "the model asked for a tool", and losing
-            # it here is invisible to every caller. Carry it with an empty agent name instead.
-            if call.tools:
-                pending.append((YvAgenticAgentCall(
-                    agent_name="",
-                    raw_match=call.raw_match,
-                    start_pos=call.start_pos,
-                    end_pos=call.end_pos,
-                ), call.tools))
-        
-        return pending
-    
-    def create_result_wrapper(
-        self,
-        result: YvAgenticResult
-    ) -> str:
-        return self.generator.generate_result_xml(
+    @staticmethod
+    def create_result_wrapper(result: YvAgenticResult) -> str:
+        """Serialize one outcome as the standard result record."""
+        return YvToolCallCodec.render_result(
+            tool_name=result.tool_name or "",
+            output=result.output,
+            agent=result.agent_name,
             success=result.success,
-            result=result.output,
-            agent_name=result.agent_name,
-            error_message=result.error
+            error=result.error or "",
+            extra={"execution_mode": result.execution_mode,
+                   "execution_time": result.execution_time},
         )
-    
-    def create_result_wrapper_with_metadata(
-        self,
-        result: YvAgenticResult
-    ) -> str:
-        result_xml = self.create_result_wrapper(result)
-        
-        if result.metadata:
-            metadata_json = json.dumps(result.metadata)
-            escaped_metadata = self.parser.escape_xml(metadata_json)
-            return f'<agent_result execution_id="{getattr(result, 'execution_id', '')}" mode="{result.execution_mode}">{result_xml}<metadata>{escaped_metadata}</metadata></agent_result>'
-        
-        return result_xml
-    
-    def merge_results(
-        self,
-        results: List[YvAgenticResult]
-    ) -> YvAgenticResult:
+
+    @staticmethod
+    def create_result_wrapper_with_metadata(result: YvAgenticResult) -> str:
+        """The same record plus its metadata, still one flat JSON document."""
+        return YvToolCallCodec.render_result(
+            tool_name=result.tool_name or "",
+            output=result.output,
+            agent=result.agent_name,
+            success=result.success,
+            error=result.error or "",
+            extra={"execution_mode": result.execution_mode,
+                   "execution_time": result.execution_time,
+                   "metadata": dict(result.metadata)},
+        )
+
+    @staticmethod
+    def merge_results(results: List[YvAgenticResult]) -> YvAgenticResult:
+        """Combine outcomes into one record without losing any of them."""
         if not results:
             return YvAgenticResult(
                 success=False,
                 output=None,
                 execution_time=0.0,
-                execution_mode="merge",
-                error="No results to merge"
+                execution_mode=YvAgenticExecutionMode.SINGLE.value,
+                error="No results to merge",
             )
-        
-        all_success = all(r.success for r in results)
-        
+
+        all_success = all(item.success for item in results)
         merged_output = {
-            "results": [r.output for r in results],
+            "results": [item.output for item in results],
             "count": len(results),
-            "all_successful": all_success
+            "all_successful": all_success,
         }
-        
-        total_time = sum(r.execution_time for r in results)
-        
-        agent_names = set(r.agent_name for r in results if r.agent_name)
-        tool_names = set(r.tool_name for r in results if r.tool_name)
-        
-        all_intermediate = []
-        for r in results:
-            all_intermediate.extend(r.intermediate_results)
-        
+        total_time = sum(item.execution_time for item in results)
+        agent_names = sorted({item.agent_name for item in results if item.agent_name})
+        tool_names = sorted({item.tool_name for item in results if item.tool_name})
+        intermediate: List[Dict[str, Any]] = []
+        for item in results:
+            intermediate.extend(item.intermediate_results)
+
         return YvAgenticResult(
             success=all_success,
             output=merged_output,
             execution_time=total_time,
-            execution_mode="merged",
+            execution_mode=YvAgenticExecutionMode.SEQUENTIAL.value,
             metadata={
-                "agent_names": list(agent_names),
-                "tool_names": list(tool_names),
-                "intermediate_count": len(all_intermediate)
+                "agent_names": agent_names,
+                "tool_names": tool_names,
+                "intermediate_count": len(intermediate),
             },
-            intermediate_results=all_intermediate
+            intermediate_results=intermediate,
         )
-    
-    def extract_tools_from_call(
-        self,
-        call: YvParsedAgenticCall
-    ) -> List[Dict[str, Any]]:
-        tools = []
-        
-        for tool in call.tools:
-            tools.append({
-                "name": tool.tool_name,
-                "parameters": tool.parameters,
-                "priority": tool.priority,
-                "fallback": tool.fallback
-            })
-        
-        return tools
-    
-    def get_agent_names(
-        self,
-        call: YvParsedAgenticCall
-    ) -> List[str]:
-        if call.agent_group:
-            return call.agent_group.agents
-        
-        return [agent.agent_name for agent in call.agents]
-    
-    def validate_call(
-        self,
-        call: YvParsedAgenticCall
-    ) -> Tuple[bool, Optional[str]]:
-        if not call.agents and not call.agent_group:
-            return False, "No agent or agent group specified"
-        
+
+    @staticmethod
+    def extract_tools_from_call(group: YvAgenticAgentCall) -> List[Dict[str, Any]]:
+        """List one agent group's calls in the standard name/arguments shape."""
+        return [{"name": call.tool_name, "arguments": dict(call.parameters)}
+                for call in group.calls]
+
+    @staticmethod
+    def get_agent_names(batch: YvToolCallBatch) -> List[str]:
+        """Named agents present in one parsed output, in order, without duplicates."""
+        names: List[str] = []
+        for group in batch.groups:
+            if group.agent_name and group.agent_name not in names:
+                names.append(group.agent_name)
+        return names
+
+    @staticmethod
+    def validate_call(group: YvAgenticAgentCall) -> Tuple[bool, Optional[str]]:
+        """Whether a group is executable: named tools are required, a named agent is not."""
+        if not group.calls:
+            return False, "Agent group carries no tool call"
+        unnamed = [call for call in group.calls if not call.tool_name.strip()]
+        if unnamed:
+            return False, f"{len(unnamed)} tool call(s) have an empty name"
         return True, None
-    
-    def get_context(
-        self,
-        execution_id: str
-    ) -> Optional[YvAgenticContext]:
+
+    def get_context(self, execution_id: str) -> Optional[YvAgenticContext]:
+        """The context registered for one execution, if it is still open."""
         return self.contexts.get(execution_id)
-    
-    def remove_context(
-        self,
-        execution_id: str
-    ) -> Optional[YvAgenticContext]:
+
+    def remove_context(self, execution_id: str) -> Optional[YvAgenticContext]:
+        """Close an execution so its bookkeeping does not accumulate."""
         return self.contexts.pop(execution_id, None)
-    
+
     def get_statistics(self) -> Dict[str, Any]:
+        """Open executions this protocol is still tracking."""
         return {
             "active_contexts": len(self.contexts),
-            "context_ids": list(self.contexts.keys())
+            "context_ids": sorted(self.contexts),
         }
 
 

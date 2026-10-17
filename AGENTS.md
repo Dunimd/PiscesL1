@@ -53,7 +53,7 @@ tools/check/       禁止项的可运行检查脚本
 
 ## 3. 硬性口径（易踩错的三条）
 
-- **模态 = 4 种**：`text / image / audio / video`。**document 与 agent 不再是独立模态** —— agent 回归文本层面的标签/特殊 token 工具调用，document 走「Agent 操作 + 文本处理」路径。必须彻底移除 `YvDocEncoder`、`YvAgenticEncoder` 的模态编码器定位及其配置项、数据管线、评测项。**机制口径（不要再发明"agent 模态"）**：模型在正常 text 模态里自回归输出一段 **JSON 文字**，外部 Agent 工具解析并执行，结果以 **`modality="text"` + `kind` 标记**回灌；模型侧不存在 agent 编码器、不存在 `tool_result` 模态分支，枚举成员/配置字段/数据管线/评测项里把工具或文档当模态的都属禁令 #18 残留。
+- **模态 = 4 种**：`text / image / audio / video`。**document 与 agent 不再是独立模态** —— agent 回归文本层面的工具调用，document 走「Agent 操作 + 文本处理」路径。必须彻底移除 `YvDocEncoder`、`YvAgenticEncoder` 的模态编码器定位及其配置项、数据管线、评测项。**机制口径（不要再发明"agent 模态"，也不要 XML 标签协议）**：模型在正常 text 模态里自回归输出一段 **行业标准 JSON**（`tool_calls[].function.name/arguments`，或 `type=tool_use` + `input`，或裸 `{name,arguments}`），外部 Agent 工具解析并执行，结果以 **`modality="text"` + `kind` 标记**回灌；`<agentic>/<tool>/<tn>` 一类 XML 标记**已删除且不做兼容**；模型侧不存在 agent 编码器、不存在 `tool_result` 模态分支，枚举成员/配置字段/数据管线/评测项里把工具或文档当模态的都属禁令 #18 残留。
 - **查算分离不是外挂检索**：7B 主参数（算/意识）+ **314B 知识块池 = 628 个 0.5B 知识块（查/潜意识）**，每次稀疏激活 ~0.5B，**被激活的知识块参与训练**。它是**模型自身权重**，不是向量库、不是 FAISS、不是文件索引。寻址/存储/调取/注入/训练隔离机制**业界无现成方案**，属本项目必须自主发明的核心创新 —— **不得臆断为 mmap / 预取 / 量化 / 分层缓存 / codebook 等任何特定实现**，那只是候选。
 - **MoE 禁止退化为 Dense**：0.5B ~ 1T 全家族必须 MoE 稀疏专家；所有规模支持全模态与思考/推理能力。
 

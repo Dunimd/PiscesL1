@@ -262,8 +262,15 @@ class YvMCPToolRegistry:
         }
     
     def get_execution_stats(self) -> Dict[str, Any]:
-        """Return execution statistics collected by the core registry."""
-        return self.core_registry.get_stats()
+        """Return execution statistics from the objects that actually record them.
+
+        `YvCoreMCPToolRegistry` has no `get_stats`, so this call raised for every caller;
+        outcomes live in the executor's manager and tool listings in its registry.
+        """
+        stats = dict(self.unified_executor.stats())
+        stats["tracked_tools"] = len(self.tools)
+        stats["native_handlers"] = len(self._native_tools)
+        return stats
     
     def reset_execution_stats(self):
         """Reset locally tracked execution counters and print a status message."""

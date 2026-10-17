@@ -111,7 +111,8 @@ class PiscesLxCheckpointVerifier:
         reference_state = reference.state_dict()
 
         report["loadable"] = self._check_loadable(reference_state, state)
-        report["trained"] = self._check_trained(reference_state, state)
+        report["trained"] = self._check_trained(
+            reference_state, state, {name for name, _ in reference.named_parameters()})
         reference.eval()
         # The scoring stage runs the full model, so a defect inside it is itself the
         # finding; report it as a failed stage instead of losing the two answers above.
@@ -161,7 +162,16 @@ class PiscesLxCheckpointVerifier:
             "tensors": len(state),
         }
 
-    def _check_trained(self, reference_state: dict, state: dict) -> dict:
+    def _check_trained(self, reference_state: dict, state: dict,
+                      parameter_names: set) -> dict:
+        """Compare every tensor the checkpoint claims to carry, split by what it is.
+
+        `state_dict()` mixes parameters and buffers, and a buffer is *supposed* to be
+        identical to a freshly built model's (running statistics, declared bounds). Counting
+        them together once made this report claim 66 "untrained" tensors when 2 of the first 5
+        samples were buffers that never train (docs/audit/00 §88). The verdict therefore reads
+        the parameter counts, and the buffer counts are reported separately rather than hidden.
+        """
         changed = 0
         identical = []
         for key, fresh in reference_state.items():
@@ -172,12 +182,21 @@ class PiscesLxCheckpointVerifier:
                 identical.append(key)
             else:
                 changed += 1
-        compared = changed + len(identical)
+
+        unchanged_params = [key for key in identical if key in parameter_names]
+        unchanged_buffers = [key for key in identical if key not in parameter_names]
+        params_compared = changed + len(unchanged_params)
         return {
             "ok": changed > 0,
             "changed": changed,
             "unchanged": len(identical),
-            "compared": compared,
+            "compared": changed + len(identical),
+            "parameters_changed": changed,
+            "parameters_unchanged": len(unchanged_params),
+            "parameters_compared": params_compared,
+            "buffers_unchanged": len(unchanged_buffers),
+            "first_unchanged_parameters": unchanged_params[: self.REPORT_LIST_ITEMS],
+            "first_unchanged_buffers": unchanged_buffers[: self.REPORT_LIST_ITEMS],
             "first_unchanged": identical[: self.REPORT_LIST_ITEMS],
         }
 
