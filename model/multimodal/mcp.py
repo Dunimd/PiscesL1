@@ -86,6 +86,18 @@ from .mcp_protocol import (
     YvMCPExecutionResult, YvMCPExecutionManager,
 )
 from ..reasoning import YvMultiPathReasoningEngine
+from utils.dc import PiscesLxLogger
+from utils.paths import PiscesLxPaths
+
+_LOG = PiscesLxLogger("PiscesLx.Multimodal.MCP",
+                      file_path=PiscesLxPaths.get_log_file("PiscesLx.Multimodal.MCP"),
+                      enable_file=True)
+
+#: Tags the unified executor records for the two registration paths. `YvMCPToolMetadata`
+#: has no `priority` field, so the classification that was previously smuggled in as
+#: `priority=10/5` is carried as a tag instead.
+NATIVE_TOOL_TAG = "native"
+EXTERNAL_TOOL_TAG = "external"
 
 class YvMCPToolRegistry:
     """Registry bridging Yv tools with the shared Pisces MCP ecosystem.
@@ -169,14 +181,13 @@ class YvMCPToolRegistry:
         # Initialize unified tool executor for better integration
         self.unified_executor = YvMCPService.executor()
         
-        # Initialize core registry for base functionality
-        self.core_registry = YvCoreMCPToolRegistry()
+        # One metadata store, shared with the executor: the executor resolves tool names from
+        # its own registry, so a second `YvCoreMCPToolRegistry()` here was state nothing read
+        # and it could diverge from what actually executes (docs/audit/00 §94).
+        self.core_registry = self.unified_executor.registry
     
     async def register_tool(self, name: str, description: str, parameters: Dict[str, Any], native_handler: Optional[Callable] = None):
-        """Register a tool with both the unified executor and core registry.
-        
-        Performs dual registration of the tool with the unified executor
-        (as native or external based on handler presence) and the core registry.
+        """Register one tool in the metadata store the unified executor resolves names from.
         
         Args:
             name (str): Tool identifier used for execution.
@@ -187,9 +198,11 @@ class YvMCPToolRegistry:
                 native execution. If None, tool is registered as external.
         
         Note:
-            Native tools get priority 10, external tools get priority 5.
-            Tools are registered with both unified_executor and core_registry.
-            Stores metadata including timestamp and execution_mode.
+            A tool is registered **once**. `YvMCPToolMetadata` has no `priority` field, so the
+            native/external distinction is carried by `tool_type` and a tag; the earlier
+            `function=`/`priority=` keywords and the calls to nonexistent `register_tool(...)`
+            methods made *every* registration raise, so no tool ever reached the executor
+            (docs/audit/00 §94).
         """
         self.tools[name] = {
             "description": description,
@@ -198,34 +211,20 @@ class YvMCPToolRegistry:
             "has_native_handler": native_handler is not None,
             "execution_mode": "native" if native_handler else "external"
         }
-        
+
         if native_handler:
             self._native_tools[name] = native_handler
-            # Register with unified executor as native tool
-            tool_metadata = YvMCPToolMetadata(
-                name=name,
-                description=description,
-                tool_type=YvMCPToolType.NATIVE,
-                parameters=parameters,
-                function=native_handler,
-                priority=10  # High priority for native tools
-            )
-            self.unified_executor.register_tool(tool_metadata)
-            print(f"[YvMCPToolRegistry] Registered native tool: {name}")
-        else:
-            # Register with unified executor as external tool
-            tool_metadata = YvMCPToolMetadata(
-                name=name,
-                description=description,
-                tool_type=YvMCPToolType.EXTERNAL,
-                parameters=parameters,
-                priority=5  # Medium priority for external tools
-            )
-            self.unified_executor.register_tool(tool_metadata)
-            print(f"[YvMCPToolRegistry] Registered external tool: {name}")
-        
-        # Also register with core registry for base functionality
-        await self.core_registry.register_tool(name, description, parameters, native_handler)
+
+        tool_metadata = YvMCPToolMetadata(
+            name=name,
+            description=description,
+            tool_type=YvMCPToolType.NATIVE if native_handler else YvMCPToolType.EXTERNAL,
+            parameters=parameters,
+            handler=native_handler,
+            tags=[NATIVE_TOOL_TAG if native_handler else EXTERNAL_TOOL_TAG],
+        )
+        self.core_registry.register(tool_metadata)
+        _LOG.info(f"[YvMCPToolRegistry] Registered {tool_metadata.tool_type.value} tool: {name}")
     
     async def handle_tool_call(self, tool_name: str, **kwargs) -> Any:
         """Execute a tool invocation using the core registry executor.
@@ -235,10 +234,32 @@ class YvMCPToolRegistry:
             **kwargs: Arguments forwarded to the tool handler.
 
         Returns:
-            Any: Execution result returned by the core registry.
+            Dict[str, Any]: `{"success", "output", "error", "duration_s", "tool"}` — a plain
+                record so the artifact can be fed back to the model as text.
+
+        Note:
+            This leg used to call `core_registry.execute_tool(...)`, a method the registry does
+            not have: every tool invocation raised AttributeError even after registration was
+            fixed. Name resolution and execution belong to the unified executor, which is what
+            reads the registry this class now writes into (docs/audit/00 §94). `execute` is
+            synchronous and returns a result record, so the record is converted here rather than
+            awaited.
         """
-        # Delegate execution to the core registry executor supporting native and external modes.
-        return await self.core_registry.execute_tool(tool_name, kwargs)
+        outcome = self.unified_executor.execute(tool_name, kwargs)
+        output = outcome.output
+        if asyncio.iscoroutine(output):
+            # The executor resolves and calls handlers synchronously, so a coroutine handler
+            # came back as an un-awaited coroutine object: `success` said True while the real
+            # result was discarded, and the artifact handed back to the model would have been
+            # a repr like `<coroutine object ...>`. Awaited here, in this async caller.
+            output = await output
+        return {
+            "tool": outcome.tool_name,
+            "success": outcome.success,
+            "output": output,
+            "error": outcome.error,
+            "duration_s": outcome.duration_s,
+        }
     
     def get_execution_stats(self) -> Dict[str, Any]:
         """Return execution statistics collected by the core registry."""

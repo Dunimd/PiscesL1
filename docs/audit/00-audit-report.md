@@ -3044,3 +3044,33 @@ Tensor with more than one value is ambiguous`（batch=1 是 0-dim，能过，所
 **范围声明（不含糊）**：关闭的是 **SEER 这一支**。A3/A14 家族里另一支
 ——`ensure_all_modules()` 在 `ensure_all_modules` 构造期崩溃的 CRV/VeriCoT/SEER 生成侧组件
 （§13 起的在册项）——**没有**被这次修复覆盖，仍在册。
+
+### §94｜把"文本→工具调用→执行→文本回灌"这条链**第一次真正接通**（A92，源码修复）
+
+**动机**：用户口径——agent 不是模态，模型在 text 里输出 JSON，工具解析执行、结果以文本回灌。
+§90/§92 把模态侧的误读清掉了，但**这条链本身在模型侧根本不存在**：`YvAgentic` 只能执行
+**别人已经解析好**的工具名。接上 `YvAgenticProtocol`（`run_agent_calls_from_text`）之后，
+一路炸出**四个连着的幽灵 API**，说明这条链从来没有端到端跑过：
+
+| # | 断点 | 现象 | 修法 |
+|---|---|---|---|
+| 1 | `mcp.py:205` 用 `function=`、`priority=10/5` 构造 `YvMCPToolMetadata` | 该数据类字段是 `handler`、**无 priority** ⇒ **任何工具注册都 TypeError** | 按真实字段构造；优先级语义改为 `tags=[NATIVE_TOOL_TAG/EXTERNAL_TOOL_TAG]`（模块常量） |
+| 2 | `unified_executor.register_tool(...)` | 执行器**没有这个方法**，只有 `registry.register(metadata)` ⇒ 工具从未进入解析表 | 改走 `registry.register(...)` |
+| 3 | `core_registry` 与 `unified_executor.registry` 是**两个实例** | "双注册"实为两套可各自漂移的状态，其中一套**无人读取** | `self.core_registry = self.unified_executor.registry`（单一事实来源） |
+| 4 | `core_registry.execute_tool(...)` | 注册器没有该方法；真实入口是 `unified_executor.execute()`（同步、返回结果记录） | 改为调用执行器并把结果转成 `{"tool","success","output","error","duration_s"}` |
+| 5 | 执行器同步调用协程 handler | `success=True` 但 `output` 是 **`<coroutine object>`**，真实结果被丢弃、且无法回灌成文本 | 在 async 调用方 `await` 协程产物（注释写明为何在这里 await） |
+| 6 | `agentic_protocol.get_pending_tool_calls` | 模型写出了 `<tool>` 但没解析出 agent 时，**整次调用被无声丢弃**（实测 `parsed=True` 而结果 0 条） | 不丢：以空 agent 名照样排入 pending，交由执行层处理 |
+
+**端到端实测**（`configs/model/0.01B.yaml` 真模型，注册一个协程 native 工具 `echo`）：
+输入 `x:<agentic mode="sequential"><an>planner</an><tool><tn>echo</tn><tp>{"text": "real result"}</tp></tool></agentic>y`
+得到 `parsed=True`、结果 1 条、**`output = {'echo': {'text': 'real result'}}`（真实结果，不再是协程对象）**、
+观察 `modality=['text']` + `kind=['tool_result']`、可 `json.dumps`、`memory.observations` 计数 1；
+纯文本输入 `parsed=False` 且 0 条（不误触发）。
+`manage.py test --stage 10` **19 套全绿**；`tools/check` **4092 / 0 警告**（未新增；本批还把
+`mcp.py` 里违规的 `print()` 换成 dmsc 日志，遵守 §6.3）。
+
+**仍如实留着的两点**：
+① `<an>` 标注没有被解析成 `call.agents`（结果里 `agent` 字段为空串）——属 XML 解析层的识别缺口，
+我**没有**用字符串猜测去糊，只保证"不静默丢弃"；
+② `mcp.py` 的 `get_execution_stats()/reset_execution_stats()` 仍调用注册器上不存在的
+`get_stats()`，是同类幽灵 API 的剩余点，未在本次路径上触发，**在册待修**。

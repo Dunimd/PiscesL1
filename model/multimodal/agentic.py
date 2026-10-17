@@ -219,6 +219,7 @@ class YvAgentic(nn.Module):
             self._vision_encoder = None
             self._audio_encoder = None
             self._video_encoder = None
+            self._agentic_protocol = None
         
 
         # MCP agent infrastructure
@@ -395,6 +396,67 @@ class YvAgentic(nn.Module):
         if self._vision_encoder is None:
             self._vision_encoder = YvVisionEncoder(self.cfg)
         return self._vision_encoder
+
+    @property
+    def agentic_protocol(self):
+        """The single object that turns model text into tool calls.
+
+        Kept lazy so the text protocol is only built for callers that actually run tools.
+        """
+        if self._agentic_protocol is None:
+            from .agentic_protocol import YvAgenticProtocol
+            self._agentic_protocol = YvAgenticProtocol()
+        return self._agentic_protocol
+
+    async def run_agent_calls_from_text(self, model_output: str,
+                                        session_id: Optional[str] = None) -> Dict[str, Any]:
+        """Execute the tool calls a model emitted as ordinary text, then feed results back as text.
+
+        This is the mechanism the architecture mandates (docs/prompts/UPGRADE_03_ARCH.md 3.3.1):
+        the model writes tagged JSON into the text stream, a tool parses and executes it, and the
+        artifact re-enters the model as a `text` observation marked with a `kind`. Before this
+        method the model side could only execute a tool name somebody else had already parsed,
+        so the documented loop was not actually closed.
+
+        Args:
+            model_output: Raw decoded text from the model.
+            session_id: Optional session key forwarded to the protocol.
+
+        Returns:
+            Dict with `parsed` (bool), `remaining_text` (text with no calls left to run),
+            `execution_id`, `results` (one entry per executed call, ordered) and
+            `observations` (the text observations pushed into memory).
+        """
+        protocol = self.agentic_protocol
+        remaining_text, context = protocol.process_model_output(model_output, session_id=session_id)
+        if context is None:
+            return {"parsed": False, "remaining_text": remaining_text,
+                    "execution_id": None, "results": [], "observations": []}
+
+        results = []
+        observations = []
+        for agent_call, tools in protocol.get_pending_tool_calls(context):
+            for tool in tools:
+                execution = await self.execute_tool_with_smart_routing(
+                    tool.tool_name, **(tool.parameters or {}))
+                payload = {"agent": agent_call.agent_name, "tool": tool.tool_name,
+                           "execution": execution}
+                results.append(payload)
+                # The artifact returns as text: a tool result is not a modality.
+                observation = YvAgenticObservation(
+                    modality="text",
+                    content=payload,
+                    metadata={"source": agent_call.agent_name,
+                              "kind": YvMCPMessageType.TOOL_RESULT.value,
+                              "execution_id": context.execution_id},
+                )
+                self.memory.add_observation(observation)
+                observations.append(observation)
+
+        protocol.remove_context(context.execution_id)
+        return {"parsed": True, "remaining_text": remaining_text,
+                "execution_id": context.execution_id,
+                "results": results, "observations": observations}
 
     @property
     def audio_encoder(self):

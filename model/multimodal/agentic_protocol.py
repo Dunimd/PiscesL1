@@ -151,9 +151,24 @@ class YvAgenticProtocol:
                         end_pos=0
                     )
                     pending.append((agent_call, call.tools))
-            else:
-                for agent in call.agents:
+                continue
+
+            agents = list(call.agents)
+            if agents:
+                for agent in agents:
                     pending.append((agent, call.tools))
+                continue
+
+            # A model that emitted a tool block without a resolvable agent must not have the
+            # call dropped in silence: the parse said "the model asked for a tool", and losing
+            # it here is invisible to every caller. Carry it with an empty agent name instead.
+            if call.tools:
+                pending.append((YvAgenticAgentCall(
+                    agent_name="",
+                    raw_match=call.raw_match,
+                    start_pos=call.start_pos,
+                    end_pos=call.end_pos,
+                ), call.tools))
         
         return pending
     
