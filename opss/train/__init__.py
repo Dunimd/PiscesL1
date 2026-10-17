@@ -62,7 +62,7 @@ Usage Examples:
     Modality-Aware Scheduling:
     >>> from opss.train import PiscesLxModalitySchedulerOperator
     >>> scheduler = PiscesLxModalitySchedulerOperator()
-    >>> scheduler.step(modality='vision')
+    >>> scheduler.step(modality='image')
 
 See Also:
     - utils.opsc.interface: Base operator interface

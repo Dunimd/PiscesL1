@@ -39,7 +39,7 @@ manage.py           # 统一 CLI 入口
 2. **Yv MoE**：稳定门控（LSTM 负载预测器）、细粒度专家分割、共享专家隔离
 3. **Subconscious System（查算分离）**：16 codebooks × 131K entries 乘积量化知识场，FiLM 调制注入——"潜意识"思想雏形：知识块权重内嵌于模型、稀疏激活、按需唤起
 4. **Memory Separation**：FAISS 外部知识检索，N-gram 地址哈希——**注意：旧的"外部检索"实现，与查算分离的正确含义（模型自身的知识块池，非外部库）不一致，需重新评估改造**
-5. **多模态感知栈**：YvVisionEncoder (SigLIP), YvVideoEncoder (3D RoPE), YvAudioEncoder (HiFi-GAN), YvDocEncoder (LayoutLMv3), YvAgenticEncoder——**注意：doc 与 agentic 编码器需按 3.3 节移除/合并**
+5. **多模态感知栈（升级后只 4 个编码器）**：YvVisionEncoder (SigLIP)、YvVideoEncoder (3D RoPE)、YvAudioEncoder (HiFi-GAN)，text 走主干词元嵌入。**不存在 `YvDocEncoder` 与 `YvAgenticEncoder`**：二者按 3.3.1 节物理删除，不得作为"编码器"留在任何模态栈清单里——把它们列进模态栈本身就会诱导下一个人把 document/agent 重新当成模态
 6. **YvDynamicModalFusion**：token 级融合，质量加权门控
 7. **长上下文**：YaRN+NTK, H2O, Streaming, Sliding Window, Linear Attention, Paged Attention, Ring Attention, OOMB
 8. **Hybrid Attention-SSM**：Mamba-3, YvSelectiveSSM, 渐进门控

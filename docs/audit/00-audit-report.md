@@ -2940,3 +2940,36 @@ docstring 明确写 `document` 与 `agent` **故意缺席**，第 5 个索引位
   GitHub 待统一推 ⇒ 该验收项当前记为**未满足**，不算完成。
 - 新发现的可机检违规：`model/multimodal/agentic.py:70/118/190/359` 等处
   写作 `'Pisces'` 后接中文字（单独使用 `Pisces`），违反 §6.6；与那 131 个打包标识问题不同源。
+
+### §90｜清除"agent/document 当模态"的四处残留（源码+指令书），并第二次记下我顶死长跑的事故
+
+**缘起**：用户指出——**不改掉承载误读的原文与代码，下一个执行者会把 agent 重新当成模态**。
+核对后的机制口径：模型在**正常 text 模态**里自回归输出 **JSON 文字**，外部工具解析执行，
+结果以 **text 观察 + `kind` 标记**回灌。`types.py:83` 的 `YvModality` 本就只含四模态
+（第 5 位是跨模态哨兵槽），所以问题不在那里，而在这四处：
+
+| 残留 | 位置 | 处理 |
+|---|---|---|
+| 模态枚举里带 `DOCUMENT` | `model/multimodal/generator.py:196` | 删除成员（实测**零引用**，删除不断裂），docstring 写明为何缺席 |
+| 工具结果走**第五个模态分支** | `model/multimodal/agentic.py:711/844` | 生产端改 `modality="text"` + `metadata["kind"]=TOOL_RESULT`；分发端把 JSON 序列化并入 text 分支，**删掉 `tool_result` 分支**（其函数体本来就已经是 tokenize→embed，只是名字在冒充模态） |
+| 文档示例用别名 `'vision'` | `opss/train/__init__.py:65` | 改为规范名 `image` |
+| **指令书原文把 doc/agentic 编码器列进"多模态感知栈"** | `docs/prompts/UPGRADE_02_MISSION.md:42` | 改写为"升级后只 4 个编码器，二者物理删除、不得再出现在模态栈清单里" |
+| 机制表述不够可执行 | `docs/prompts/UPGRADE_03_ARCH.md` 3.3.1 + `AGENTS.md` §3 | 补四条编号口径：JSON-in-text → 外部解析执行 → text 观察回灌 → 模型侧无 agent 编码器/无 tool_result 分支 |
+
+**顺带发现并修掉的真能力缺口**：`process_observation` 只有 text/image/audio 三个分支，
+**`video` 落到 `raise Unsupported observation modality`** —— 四模态里三模态可达，属禁令 #2（降低能力）。
+补 `video_encoder` 惰性属性（镜像 audio 的写法）与 video 分支：张量帧走编码器，
+字符串路径明确拒绝并说明"解码不归本层"（不做静默丢弃，也不留 stub）。
+
+**防复发的机检点（这才是关键，不是改完就算）**：`YvAgenticObservation.__post_init__`
+用 `YvModality.is_supported` 做**构造期校验**。实测：`text/image/audio/video` 四者接受；
+`tool_result / document / agent / vision` **四者全部在构造时抛错**，错误信息直接给出四模态白名单。
+`tools/check` 错误数 **4094 不变**（本批未新增违规）。
+
+**事故（第二次，同一原因，在我身上）**：窗口十一（275→300）在启动约 3 分钟后**静默死亡**——
+日志 mtime 冻结、无 `Training completed`、无 Traceback、无 `checkpoint_step_300`，
+现场只剩一个 19 MB 的 python 进程，free commit 3.884 GB。
+共同因子明确：**我在长跑期间并发了 `verify_checkpoint`、模块导入探针与全仓 AST 检查**。
+这已经是我今天第二次因为同一件事毁掉运行（第一次见 §85）。
+**处置**：本机在长跑期间不再起任何 GB 级进程；后续窗口要么单独起、要么等他让出机器；
+这条不是环境问题，是我的操作纪律问题，两次都由我造成。

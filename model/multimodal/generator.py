@@ -194,11 +194,15 @@ class YvGenerationConfig:
 
 
 class YvGenerationModality(Enum):
-    """Supported generation modalities."""
+    """Supported generation modalities — exactly the four first-class ones.
+
+    ``DOCUMENT`` is absent by design: documents reach the model through the
+    agent+text path, and a modality enum carrying it invited reading document back
+    into the modality system (docs/prompts/UPGRADE_03_ARCH.md 3.3.1, 禁令 #18).
+    """
     IMAGE = auto()
     VIDEO = auto()
     AUDIO = auto()
-    DOCUMENT = auto()
     TEXT = auto()
 
 

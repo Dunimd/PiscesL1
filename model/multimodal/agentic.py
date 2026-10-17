@@ -218,6 +218,7 @@ class YvAgentic(nn.Module):
             # Lazy initialization: Do NOT create encoders at init time to save memory
             self._vision_encoder = None
             self._audio_encoder = None
+            self._video_encoder = None
         
 
         # MCP agent infrastructure
@@ -411,6 +412,22 @@ class YvAgentic(nn.Module):
         if self._audio_encoder is None:
             self._audio_encoder = YvAudioEncoder(self.cfg)
         return self._audio_encoder
+
+    @property
+    def video_encoder(self):
+        """Expose the video encoder so `video` observations are processable at all.
+
+        `process_observation` dispatched text/image/audio and then raised for every video
+        observation: four supported modalities, three reachable ones.
+        """
+        if self._base_model_ref:
+            base = self._base_model_ref()
+            if base is not None and hasattr(base, "video"):
+                return base.video
+        if self._video_encoder is None:
+            from .video import YvVideoEncoder
+            self._video_encoder = YvVideoEncoder(self.cfg)
+        return self._video_encoder
 
     async def register_capability(self, name: str, description: str,
                                   parameters: Dict[str, Any], handler: Callable):
@@ -708,9 +725,10 @@ class YvAgentic(nn.Module):
         result_data = message.payload
         
         observation = YvAgenticObservation(
-            modality="tool_result",
+            modality="text",
             content=result_data,
-            metadata={"source": message.agent_id}
+            metadata={"source": message.agent_id,
+                      "kind": YvMCPMessageType.TOOL_RESULT.value}
         )
         
         self.memory.add_observation(observation)
@@ -814,8 +832,17 @@ class YvAgentic(nn.Module):
             modules.
         """
         if observation.modality == "text":
+            # A tool result is a text observation (docs/prompts/UPGRADE_03_ARCH.md 3.3.1):
+            # the JSON string is the payload and `metadata["kind"]` records what produced it.
+            # It used to have its own `modality == "tool_result"` branch, which made a fifth
+            # modality visible in code even though the body was already tokenize-then-embed.
+            import json
+            if (observation.metadata or {}).get("kind") == YvMCPMessageType.TOOL_RESULT.value:
+                payload = json.dumps(observation.content)
+            else:
+                payload = str(observation.content)
             if hasattr(self, 'tokenizer') and self.tokenizer:
-                tokens = self.tokenizer.encode(str(observation.content), return_tensors="pt")
+                tokens = self.tokenizer.encode(payload, return_tensors="pt")
                 if self.base_model:
                     return self.base_model.embed_tokens(tokens)
                 raise ValueError(
@@ -841,21 +868,18 @@ class YvAgentic(nn.Module):
             elif torch.is_tensor(observation.content):
                 return self.audio_encoder(observation.content)
         
-        elif observation.modality == "tool_result":
-            # Convert structured tool output into a textual embedding surrogate.
-            import json
-            result_str = json.dumps(observation.content)
-            if hasattr(self, 'tokenizer') and self.tokenizer:
-                tokens = self.tokenizer.encode(result_str, return_tensors="pt")
-                if self.base_model:
-                    return self.base_model.embed_tokens(tokens)
-                raise ValueError(
-                    "YvAgentic.process_observation(tool_result) requires a bound base_model "
-                    "to embed serialized tool outputs."
-                )
-            raise ValueError("YvAgentic.process_observation(tool_result) requires a tokenizer.")
+        elif observation.modality == "video":
+            # `YvVideoEncoder.forward` takes decoded frames, so a tensor is the only
+            # representable payload here; a path would need a decoder this stage does not
+            # own, and silently dropping frames is worse than refusing them.
+            if torch.is_tensor(observation.content):
+                return self.video_encoder(observation.content)
+            raise ValueError(
+                "YvAgentic.process_observation(video) requires decoded frames as a tensor; "
+                f"got {type(observation.content).__name__}."
+            )
 
-        raise ValueError(f"Unsupported or unprocessable observation modality: {observation.modality}")
+        raise ValueError(f"Unsupported observation modality: {observation.modality}")
 
     async def plan_action(self, context: Dict[str, Any]) -> YvAgenticAction:
         """Generate an agent action using retrieval-augmented reasoning.
