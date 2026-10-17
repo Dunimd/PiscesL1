@@ -3027,3 +3027,20 @@ Tensor with more than one value is ambiguous`（batch=1 是 0-dim，能过，所
 **规则当场抓到的一处我自己的残留**：`model/multimodal/types.py` 的构造期校验文档字符串里
 写着 `modality="tool_result"`（讲述历史），也被判为误导载体。已改写措辞——
 **连解释缺陷的例句都不能重新引入误读**，这是这条规则最有说服力的一次命中。
+
+### §93｜A91 顺带关闭 A3/A14 的 SEER 分支（同一根因，实测）
+
+审计里挂了很久的"A3/A14：`seer_executor.py` 的 `if agent_id == 0:` 在 `agent_id` 为张量时抛
+`RuntimeError: Boolean value of Tensor with more than one value is ambiguous`，
+默认前向（`return_tool_outputs` 未显式关闭）即崩"——**与 §91 是同一个根因的两种表述**：
+签名撒谎 `-> int`、实返 `[batch]` 张量。§91 把选择改成逐行 Python int 并逐行产出结果后，
+这条崩溃**随之消失**。
+
+**实测口径**：`configs/model/0.01B.yaml` 真模型、`m.train()`、**不传 `return_tool_outputs`
+（走 model.py:2090 的默认 True）**，batch=1/2/3 各跑一次完整前向+反向：
+三次全部通过，`tool_output` 长度分别 1/2/3，`-W error::UserWarning` 下无警告
+（§91 表格里的就是这条路径，当时我只把它记成批语义修复，没点出它同时关掉了一条老崩溃）。
+
+**范围声明（不含糊）**：关闭的是 **SEER 这一支**。A3/A14 家族里另一支
+——`ensure_all_modules()` 在 `ensure_all_modules` 构造期崩溃的 CRV/VeriCoT/SEER 生成侧组件
+（§13 起的在册项）——**没有**被这次修复覆盖，仍在册。
