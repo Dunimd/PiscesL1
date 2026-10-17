@@ -821,13 +821,20 @@ class PiscesLxTrainOrchestrator(PiscesLxBaseOperator):
             "temperature_max": "moe_temperature_max",
             "expert_temperature_max": "expert_temperature_max",
             "expert_load_balance_threshold": "expert_load_balance_threshold",
+            "aux_routing_heads": "moe_aux_routing_heads",
         }
         for src_key, dst_key in mapping.items():
             if src_key in moe_cfg and moe_cfg[src_key] is not None:
                 try:
                     setattr(model_cfg, dst_key, moe_cfg[src_key])
-                except Exception:
-                    pass
+                except (AttributeError, TypeError) as error:
+                    # A stage file that names an MoE override the model config cannot hold is a
+                    # configuration error, not a condition to run through: swallowing it makes the
+                    # declared override silently inert, which is the exact failure mode this
+                    # project keeps re-registering (docs/audit/00 §81).
+                    _LOG.error(
+                        f"Stage `moe.{src_key}` cannot be applied to the model config as "
+                        f"`{dst_key}`: {error}")
 
         return model_cfg
 
