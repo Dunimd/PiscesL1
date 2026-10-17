@@ -2973,3 +2973,35 @@ docstring 明确写 `document` 与 `agent` **故意缺席**，第 5 个索引位
 这已经是我今天第二次因为同一件事毁掉运行（第一次见 §85）。
 **处置**：本机在长跑期间不再起任何 GB 级进程；后续窗口要么单独起、要么等他让出机器；
 这条不是环境问题，是我的操作纪律问题，两次都由我造成。
+
+### §91｜A91：SEER 执行器的批语义错误（源码修复，实测）
+
+**缺陷**：`model/multimodal/seer_executor.py` 的 `_select_agent` 签名写 `-> int`，
+实际返回 `logits.argmax(dim=-1)`，形状 `[batch]`。于是
+① `if agent_id == 0:` 在 **batch>1 时对多元素张量求布尔** → `RuntimeError: Boolean value of
+Tensor with more than one value is ambiguous`（batch=1 是 0-dim，能过，所以长期被掩盖）；
+② 即使不抛，`result["tool_result"]` 只有**一份**，N 行样本被强行报成同一个 agent；
+③ `accept_threshold` 与 critic 判定用裸字面量 `0.5`（4 处）；路由宽度 `4` 与角色名硬编码分离，
+角色与分支可能各改各的。
+
+**修法**：`_select_agent` 返回 `list[int]`（每行一个，显式说明 argmax 是**控制决策**不是可微路径）；
+`_challenger_forward` 返回 `list[float]` 逐行；`forward` 按行产出**对齐批次的结果列表**；
+新增 `self.agent_role_names = ("challenger","planner","solver","critic")` 单一事实来源
+——**路由输出宽度由 `len(agent_role_names)` 导出**，越界选择直接抛错点名；
+接受阈值改为声明字段 `YvConfig.seer_critic_accept_threshold`（默认 0.5，含来源注释）。
+另修 PyTorch 警告根因：喂给文本的统计值一律 `detach()`（梯度路径是独立的 `seer_loss`），
+不再把 requires_grad 张量读成 Python float。
+
+**实测（0.01B 真模型，`-W error::UserWarning` 下）**
+| batch | 之前 | 现在 |
+|---|---|---|
+| 1 | 通过（掩盖了缺陷） | 通过，`tool_output` 1 条 |
+| 2 | **RuntimeError: ambiguous truth value** | 通过，2 条、逐行 confidence（样例 `solve task, confidence=0.506`），**无 UserWarning** |
+| 3 | 同上崩溃 | 通过，3 条对齐 |
+
+`manage.py test --stage 10` 现 **19 套全绿**（含本会话新增的 `test_state_geometry_contract`、
+`test_operator_precedence_contract`）；`tools/check` 错误 **4094 → 4092**（消掉两处字面量）。
+
+**在册未解（不夹带）**：`agent_router` 本身**没有梯度覆盖** —— argmax 是硬选择，
+它的四个角色权重只被读不被训。这与 A72/A21 是同一族问题（"门只被判真假、从未以可微方式作用"），
+但 SEER 的输出是**文本 payload**，不能照搬值中性直通门；正确解法要另立机制与证明，已登记不猜做。

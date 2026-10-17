@@ -175,10 +175,15 @@ class YvSEERExecutor(nn.Module):
         self.solver_proj = nn.Linear(self.hidden_size, agent_dim)
         self.critic_proj = nn.Linear(self.hidden_size, agent_dim)
 
+        # One tuple names the whole SEER roster: it sets the router width, so the choice
+        # domain and the text-building branch cannot drift apart.
+        self.agent_role_names = ("challenger", "planner", "solver", "critic")
+        self.critic_accept_threshold = float(config.seer_critic_accept_threshold)
+
         self.agent_router = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size // 4),
             nn.GELU(),
-            nn.Linear(self.hidden_size // 4, 4),
+            nn.Linear(self.hidden_size // 4, len(self.agent_role_names)),
         )
 
         self.difficulty_scorer = nn.Sequential(
@@ -202,16 +207,29 @@ class YvSEERExecutor(nn.Module):
             self._tools[tool.name] = tool
             self._stats[tool.name] = {"calls": 0, "success": 0, "fail": 0, "total_time": 0.0}
 
-    def _select_agent(self, hidden_state: torch.Tensor) -> int:
+    def _select_agent(self, hidden_state: torch.Tensor) -> list[int]:
+        """Choose one agent per batch row.
+
+        The choice is a control decision over which text payload to emit, so it is
+        materialised as Python ints: `argmax` carries no gradient and the previous
+        annotation promised `int` while returning a `[batch]` tensor, which made
+        `if agent_id == 0:` raise "Boolean value of Tensor ... is ambiguous" for any
+        batch larger than one (docs/audit/00 §91). Gradient coverage of `agent_router`
+        is a separate open question and is not smuggled in here.
+        """
         pooled = hidden_state.mean(dim=1)
         logits = self.agent_router(pooled)
-        return logits.argmax(dim=-1)
+        return logits.argmax(dim=-1).tolist()
 
-    def _challenger_forward(self, x: torch.Tensor) -> float:
+    def _challenger_forward(self, x: torch.Tensor) -> list[float]:
+        """Per-row difficulty estimates; one value per batch row."""
         emb = self.challenger_proj(x.mean(dim=1))
         difficulty = self.difficulty_scorer(emb).squeeze(-1)
         curriculum_bias = torch.sigmoid(self.evolution_step.float() * 0.001)
-        return (difficulty + curriculum_bias).mean().item()
+        # Detached: these numbers only label the emitted text. The gradient path is the
+        # separate `seer_loss`, and reading a requires_grad tensor into a Python float
+        # warns for exactly that reason.
+        return (difficulty + curriculum_bias).detach().tolist()
 
     def _critic_score(self, x: torch.Tensor) -> torch.Tensor:
 
@@ -241,39 +259,57 @@ class YvSEERExecutor(nn.Module):
         if hs is None:
             return result
 
-        agent_id = self._select_agent(hs)
+        agent_choices = self._select_agent(hs)
 
-        difficulty = self._challenger_forward(hs)
+        difficulties = self._challenger_forward(hs)
         critic_scores = self._critic_score(hs)
-        critic_mean = critic_scores.mean().item()
+        critic_values = critic_scores.detach().tolist()
+        critic_mean = float(critic_scores.detach().mean())
 
-        if agent_id == 0:
-            result["tool_result"] = {
-                "agent": "challenger",
-                "difficulty": difficulty,
-                "suggestion": f"generate task at difficulty {difficulty:.3f}",
-            }
-        elif agent_id == 1:
-            result["tool_result"] = {
-                "agent": "planner",
-                "difficulty": difficulty,
-                "plan_quality": critic_mean,
-                "suggestion": f"plan task at difficulty {difficulty:.3f}, quality={critic_mean:.3f}",
-            }
-        elif agent_id == 2:
-            result["tool_result"] = {
-                "agent": "solver",
-                "confidence": critic_mean,
-                "suggestion": f"solve task, confidence={critic_mean:.3f}",
-            }
-        elif agent_id == 3:
-            result["tool_result"] = {
-                "agent": "critic",
-                "quality_score": critic_mean,
-                "accept_threshold": 0.5,
-                "accepted": critic_mean > 0.5,
-                "suggestion": f"critique: quality={critic_mean:.3f}, {'accepted' if critic_mean > 0.5 else 'rejected'}",
-            }
+        # The router emits exactly `SEER_AGENT_ROLES` logits, so the choice is always one of
+        # the four roles below. Results are one entry per batch row: the previous code produced
+        # a single dict for the whole batch, so a batch of N rows was reported as one agent.
+        tool_results: list[dict] = []
+        for row, choice in enumerate(agent_choices):
+            if choice >= len(self.agent_role_names):
+                raise ValueError(
+                    f"SEER router selected role index {choice} but only "
+                    f"{len(self.agent_role_names)} roles are declared: "
+                    f"{self.agent_role_names}")
+            difficulty = difficulties[row]
+            quality = critic_values[row]
+            role = self.agent_role_names[choice]
+            if role == "challenger":
+                tool_results.append({
+                    "agent": role,
+                    "difficulty": difficulty,
+                    "suggestion": f"generate task at difficulty {difficulty:.3f}",
+                })
+            elif role == "planner":
+                tool_results.append({
+                    "agent": role,
+                    "difficulty": difficulty,
+                    "plan_quality": quality,
+                    "suggestion": f"plan task at difficulty {difficulty:.3f}, quality={quality:.3f}",
+                })
+            elif role == "solver":
+                tool_results.append({
+                    "agent": role,
+                    "confidence": quality,
+                    "suggestion": f"solve task, confidence={quality:.3f}",
+                })
+            else:
+                tool_results.append({
+                    "agent": role,
+                    "quality_score": quality,
+                    "accept_threshold": self.critic_accept_threshold,
+                    "accepted": quality > self.critic_accept_threshold,
+                    "suggestion": (
+                        f"critique: quality={quality:.3f}, "
+                        f"{'accepted' if quality > self.critic_accept_threshold else 'rejected'}"
+                    ),
+                })
+        result["tool_result"] = tool_results
 
         if aux_loss is not None:
             result["seer_loss"] = aux_loss * (1.0 - critic_mean) * 0.01

@@ -857,6 +857,9 @@ class YvConfig:
     # === 2026 flagship feature flags ===
     use_rca_fusion: bool = True
     use_seer_executor: bool = True
+    #: Acceptance bar the `critic` role applies to its own quality estimate. Declared here
+    #: because it used to be the literal `0.5` inside the executor (docs/prompts/UPGRADE_06 §6.7).
+    seer_critic_accept_threshold: float = 0.5  # model/multimodal/seer_executor.py:critic branch
     use_vericot: bool = True
     comet_write_interval: int = 1
     use_token_sparse_attn: bool = True
