@@ -315,9 +315,9 @@ class YvAgenticObservation:
         """Refuse any modality outside the four first-class ones.
 
         Construction is where a fifth modality would re-enter the system: the agent stack
-        used to accept ``modality="tool_result"``, which read as a modality even though the
+        used to carry a ``tool_result`` modality label, which read as a fifth modality even though the
         payload was ordinary serialized text (docs/prompts/UPGRADE_03_ARCH.md 3.3.1, 禁令 #18).
-        A tool result is therefore ``modality="text"`` carrying ``metadata["kind"]``.
+        A tool result is therefore text, with ``metadata["kind"]`` recording what produced it.
         """
         if not YvModality.is_supported(self.modality):
             raise ValueError(

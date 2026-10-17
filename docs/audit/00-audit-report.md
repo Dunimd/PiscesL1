@@ -3005,3 +3005,25 @@ Tensor with more than one value is ambiguous`（batch=1 是 0-dim，能过，所
 **在册未解（不夹带）**：`agent_router` 本身**没有梯度覆盖** —— argmax 是硬选择，
 它的四个角色权重只被读不被训。这与 A72/A21 是同一族问题（"门只被判真假、从未以可微方式作用"），
 但 SEER 的输出是**文本 payload**，不能照搬值中性直通门；正确解法要另立机制与证明，已登记不猜做。
+
+### §92｜把"agent/document 是模态"变成**可机检**（含正控制）
+
+§90 手工清了四处残留，但手工清一次不等于不再长回来。看现成的 `PiscesLxModalityCheck` 时发现：
+它声明了 `_EXPECTED = (text, image, audio, video)` **却从未使用** —— 只扫标识符名，
+**不扫模态取值**。这正好解释了 §90 那批残留为什么能活着：`modality="tool_result"`、
+`YvGenerationModality.DOCUMENT`、文档别名 `'vision'` 全都**不在标识符模式的射程内**。
+
+**规则补了两类取值级判据**（`tools/check/checks_hygiene.py`）：
+① 任何 `modality(==|=|:)` 字面量不在四模态白名单内 ⇒ `MODALITY-4-UNKNOWN-VALUE`，
+   并对本仓见过的别名直接给出规范名（`vision→image`、`sound→audio`、`clip→video`、`txt→text`）；
+② 任何类名以 `Modality` 结尾的枚举里出现 `DOCUMENT/DOC/AGENT/TOOL_RESULT/TOOL/TABLE/CHART`
+   成员 ⇒ `MODALITY-4-NO-DOCUMENT`（类作用域由缩进跟踪，模块级语句即退出）。
+
+**正控制（新规则报 0 命中时必须先证明它能报非 0）**：临时放一个探针文件，内含
+`class YvProbeModality(Enum): DOCUMENT = auto()` 与 `modality="agent"`，
+两条**都当场被抓**（并顺带被 EXPOSE-CLASSES-ONLY / HEADER-VERBATIM 抓住，说明其它闸门也在线）；
+删除探针后 `MODALITY-4` 命中归 **0**，`tools/check` 错误 **4092**。
+
+**规则当场抓到的一处我自己的残留**：`model/multimodal/types.py` 的构造期校验文档字符串里
+写着 `modality="tool_result"`（讲述历史），也被判为误导载体。已改写措辞——
+**连解释缺陷的例句都不能重新引入误读**，这是这条规则最有说服力的一次命中。

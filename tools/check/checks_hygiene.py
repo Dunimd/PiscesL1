@@ -389,7 +389,58 @@ class PiscesLxModalityCheck(PiscesLxStandardCheck):
                 self._scan(source, self._AGENT_MODALITY, "MODALITY-4-NO-AGENT",
                            "agent survives as an independent modality — it is text-level tool calling")
             )
+            # Identifiers alone were not enough: the residues this session found were all
+            # *values* — `modality="tool_result"`, a `DOCUMENT` member of a modality enum, and
+            # a documented alias `'vision'`. `_EXPECTED` was declared but never consulted.
+            violations.extend(self._scan_values(source))
         return violations
+
+    _MODALITY_VALUE = re.compile(
+        r"\bmodality(?:_type)?\s*(?:==|!=|=|:)\s*[\"']([A-Za-z_]+)[\"']")
+    _MODALITY_CLASS = re.compile(r"^\s*class\s+\w*Modality\w*\b")
+    _MODALITY_ENUM_ROLE = re.compile(
+        r"^\s{4,}(DOCUMENT|DOC|AGENT|TOOL_RESULT|TOOL|TABLE|CHART)\b\s*=")
+    _MODULE_LEVEL = re.compile(r"^\S")
+    #: Aliases observed in this repository; a wrong name is still a wrong modality.
+    _ALIAS_CANONICAL = {"vision": "image", "sound": "audio", "clip": "video", "txt": "text"}
+
+    def _scan_values(self, source: PiscesLxSourceFile) -> list:
+        """Flag modality *values* outside the four, and non-modality members inside modality enums."""
+        hits = []
+        in_modality_class = False
+        for index, line in enumerate(source.lines, start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if self._MODALITY_CLASS.match(line):
+                in_modality_class = True
+                continue
+            if self._MODULE_LEVEL.match(line):
+                in_modality_class = False
+            if in_modality_class:
+                role = self._MODALITY_ENUM_ROLE.match(line)
+                if role:
+                    hits.append(PiscesLxViolation(
+                        "MODALITY-4-NO-DOCUMENT", source.path, index,
+                        f"a modality enum declares `{role.group(1)}`; modalities are exactly "
+                        f"{self._EXPECTED} — documents and tool calls are text",
+                        snippet=stripped[:160]))
+                continue
+            value = self._MODALITY_VALUE.search(line)
+            if not value:
+                continue
+            name = value.group(1).lower()
+            if name in self._EXPECTED:
+                continue
+            hint = ""
+            if name in self._ALIAS_CANONICAL:
+                hint = f" — the canonical name is '{self._ALIAS_CANONICAL[name]}'"
+            hits.append(PiscesLxViolation(
+                "MODALITY-4-UNKNOWN-VALUE", source.path, index,
+                f"modality value `{value.group(1)}` is not one of {self._EXPECTED}{hint}; "
+                "structured payloads must arrive as 'text' with a kind marker",
+                snippet=stripped[:160]))
+        return hits
 
     _EXEMPT = ("third_party/", "docs/", "tools/check/")
 
