@@ -2873,3 +2873,30 @@ A67/A72 早已记录训练器有两条**重算 loss** 的分支（response-mask 
 这不是接线缺陷，而是**类型用错**：应为 buffer/常量，或改成正向可微的用法。
 下一步先枚举全部"只当边界/常数用却被声明为 Parameter"的量，再按类型收口（属模型本体改动，
 需同步配置与文档）。
+
+### §88｜撤回我刚登记的 A88，并更正我自己用了多轮的一个指标口径（2026-10-17）
+
+**撤回一（A88 不成立）**：§87 把 `expert_temperature_max`、`soft_moe_budget` 说成
+"声明成 `nn.Parameter` 却用作 clamp 上界，数学上不可能有梯度"。读码结果：**两者本来就是 buffer**
+（`model/moe/gate.py:185` 与 `:231` 的 `register_buffer`），而 `soft_moe_budget` 在损失项里
+就是当作**目标值**用并显式 `.detach()`（`:461`）。未变是**设计如此**，不是缺陷。
+我的错误来自"从未更新清单里有它 ⇒ 它一定是参数"的反向推断，**没有先读它的声明**。
+
+**撤回二（更重要，关系到我引用过多轮的数）**：`tools/dev/verify_checkpoint.py:111` 比对的是
+**`state_dict()`**，而 `state_dict()` **包含 buffer**。因此我从 §77 起一路引用的
+"`changed=512/578`、`unchanged=66/50`" **混合了参数与非训练性质 buffer**，
+把它表述为"多少个参数从未训练"是**口径夸大**。
+样本已经说明问题：step275 的 `first_unchanged` 五项里 `aux_kv_gate`、`dt_proj.bias`、`conv_mode.D`
+是参数，而 `expert_temperature_max`、`soft_moe_budget` 是 buffer —— **5 个里 2 个本就不该变**。
+**真实数字尚未测出**：要区分必须把比对拆成 `named_parameters()` 与 `named_buffers()` 两栏。
+这是接下来第一个要做的源码改动（改完才能诚实报告"未训练参数到底几个"）。
+
+**顺带一条真实缺陷（登记为 A88'）**：`model/moe/gate.py:1526-1527` 在容器门里执行
+`self.gate.expert_temperature_max = getattr(cfg, 'expert_temperature_max', 5.0)` ——
+把一个 **float 直接赋到一个已注册 buffer 的名字上**。Python 层会**用 float 顶掉该 buffer 属性**，
+于是该量从此**不在 `state_dict()` 里**，检查点不再携带它，且 `high=` 的类型也从张量变成 float。
+这是"声明为 buffer、运行期被当普通属性覆写"的类型混淆，属真实缺陷（修法：改 `buffer.data` 或改名，
+待窗口十一结束后一并处理）。
+
+**纪律沉淀（本轮第三次自我更正，都靠读码/实测）**：凡是**反向推断声明类型**的结论，
+必须先读那一行声明本身；凡是引用一个统计口径，必须先确认它的分母包含什么。
