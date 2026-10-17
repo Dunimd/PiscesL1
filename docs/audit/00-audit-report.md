@@ -3559,3 +3559,39 @@ buffer，于是该量掉出 `state_dict()`"。**机制是错的**，错在我没
 驱动，而不是一个新旗标。数据侧沿用 `tool_trace.py:75-83` 的先例：文档形状与运行时解析同源。
 取证与判据在案，本轮**不动这批源码**（stage-10 与 checker 正在跑，遵守"跑测试期间不改源码"）。
 
+## §109｜M1 的欠账：服务侧仍按 XML 解析工具调用，所以"能执行工具调用"这句话在服务模式下不成立（登记 A94，含精确取证）
+
+M1 把方言换成 JSON、删掉 `xml_utils.py` 之后，**运行时解析器**（`YvToolCallCodec`）、
+**agentic 协议层**与**数据侧**（`tools/data/tool_trace.py` 复用同一 codec 渲染）已经同源；
+但推理服务这一层没跟着换，实测读码确认两处仍是 XML：
+
+1. `tools/infer/core.py:768` `_process_tool_calls(text, tool_registry)` —— 这是服务生成文本后
+   **真正执行工具调用的路径**。入口判据是 `agentic_pattern = r'<agentic[^>]*>.*?</agentic>'`
+   （`:780`），其后 `<ag>`/`<tool>`/`<tn>`/`<tp>` 逐级正则（`:790/:797/:801/:805`）。
+   JSON 文档里没有 `<agentic>`，`re.findall` 返回空 → `:783` 原样返回文本，
+   **一次工具调用都不会执行**。结果回灌格式也仍是 XML 包装
+   （`<result>…</result>` / `<error>…</error>`，`:823/:825/:832/:834/:843`）。
+2. `tools/infer/agent_interceptor.py:116` 自述"detects XML-based agent patterns"，
+   `:160-188` 的 7 条正则（`agentic_block`/`agent_invoke`/`swarm_invoke`/`orchestrate_invoke`/
+   `tool_invoke`/`tool_args`/`agent_with_params`）同样恒不命中，
+   `intercept()`(`:196`)、`has_agent_pattern()`(`:354`)、`extract_tool_calls()`(`:382`) 在 JSON 语料上
+   恒为空/恒为假——不是报错，是**静默全盲**。
+
+另有一处**声明与实现分家**：`model/tokenizer/special_tokens.py:163/:205` 仍把
+`tool_token` 声明为 `"<tool>"`，而这个标记已不属于任何被解析的方言。
+
+**因此本会话起口径更正**：凡"工具调用链路端到端可用"的结论，只在
+`YvAgenticProtocol`/`YvToolCallCodec`/`run_agent_calls_from_text()`（A92/M1 实测通过的那条）成立；
+**经 `tools/infer` 服务路径的端到端不成立**，此前若读者理解为"服务端也能执行"，以本节为准。
+
+**修复口径（下一步一次做好，不留兼容层）**：`_process_tool_calls` 改为
+`YvToolCallCodec.parse(text)` → 执行（`self._agentic.execute_unified_tool` 或
+`tool_registry.execute` 两支都保留，它们与方言无关）→ `YvToolCallCodec.render_result(...)` 回灌，
+删掉整段 XML 正则与 `<result>`/`<error>` 字符串拼接；`agent_interceptor` 的 7 条正则删除、
+检测改走同一 codec（`YvToolCallBatch`），类文档自述同步为 JSON；`special_tokens.tool_token`
+随之除根。判据要机检：一条服务侧契约测试，喂**数据侧生成器实际产出的同一份文档**
+（`tools/data/tool_trace.py` 的形状）经 `_process_tool_calls`，断言注册工具确实被调用且结果以
+codec 的结果形状回灌——照 §"文档形状与运行时解析同源"的先例，禁止测试里再写第三种方言。
+本轮**不改这批源码**：整段替换需先读全 `:843` 之后的收尾分支再一次性落地，
+剩余窗口不足以同时完成改动与验证，宁可留精确取证也不交一个未验证的推理服务改动。
+
