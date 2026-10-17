@@ -100,6 +100,12 @@ from utils.dc import PiscesLxLogger
 from utils.paths import PiscesLxPaths
 _LOG = PiscesLxLogger("Yv.Moe", file_path=PiscesLxPaths.get_log_file("Yv.Moe"), enable_file=True)
 # Paper: Shazeer et al., "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer", ICLR 2017, arXiv:1701.06538; DeepSeek-AI, "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model", arXiv:2405.04434; DeepSeek-AI, "DeepSeek-V3 Technical Report", arXiv:2412.19437
+#: Below this declared loudness an auxiliary head is left exactly as authored (no rescaling).
+_RESONANCE_OFF = 0.0
+#: Guards the RMS ratio: an all-zero term or an all-zero gate carries no scale to match.
+_RESONANCE_EPS = 1e-12
+
+
 class YvMoEGate(nn.Module):
     """Expert routing gate for MoE with top-k selection and load balancing.
     
@@ -208,6 +214,10 @@ class YvMoEGate(nn.Module):
             name.strip() for name in declared.split(',') if name.strip())
 
         # HiCL DG-gated routing
+        #: Declared loudness of an auxiliary head, relative to the main gate's own logit
+        #: spread (see :meth:`_resonant_head_contribution`).
+        self.aux_head_resonance = float(
+            getattr(cfg, 'moe_aux_head_resonance', 0.0) if cfg is not None else 0.0)
         from .hicl_router import YvDGEncoder as _YvDG
         self.hicl_dg_dim = hidden_size * 4
         self.hicl_dg_encoder = _YvDG(hidden_size, expansion_factor=4, sparsity_k=32, device=device, dtype=dtype)
@@ -285,6 +295,25 @@ class YvMoEGate(nn.Module):
         # Lazy stale gate weight - only allocated when anticipatory update runs
         self._stale_gate_weight: Optional[torch.Tensor] = None
 
+    def _resonant_head_contribution(self, main_logits: torch.Tensor,
+                                    term: torch.Tensor) -> torch.Tensor:
+        """Rescale an auxiliary head so its spread matches the gate it advises.
+
+        Measured at step 0 on the host tier, the HiCL term's RMS is ~0.4% of the main gate's
+        (2.09e-03 vs 5.20e-01), which the hard top-k below quantises away: the head keeps a
+        gradient but can never change a routing decision (docs/audit/00 §97/§99). Scaling by
+        the ratio of detached RMS values changes amplitude only - it does not add a second
+        gradient path - and `moe_aux_head_resonance` stays the declared loudness, with 0.0
+        restoring the previous inert behaviour.
+        """
+        if self.aux_head_resonance <= _RESONANCE_OFF:
+            return term
+        main_rms = float(main_logits.detach().square().mean().sqrt())
+        term_rms = float(term.detach().square().mean().sqrt())
+        if main_rms <= _RESONANCE_EPS or term_rms <= _RESONANCE_EPS:
+            return term
+        return term * (self.aux_head_resonance * main_rms / term_rms)
+
     def _should_compute_aux_head(self, sparse_gate: nn.Parameter, pruned_name: str) -> bool:
         """Check whether an auxiliary routing head should be computed.
         
@@ -344,19 +373,19 @@ class YvMoEGate(nn.Module):
         if self._routing_heads_enabled or not self.training:
             # HiCL DG-gated routing
             if self._should_compute_aux_head(self.sparse_gate_hicl, 'hicl'):
-                logits = logits + (self.w_hicl * YvNumericalGuard.straight_through_gate(
-                    self.sparse_gate_hicl)) * torch.mm(
+                logits = logits + self._resonant_head_contribution(logits, self.w_hicl * YvNumericalGuard.straight_through_gate(
+                    self.sparse_gate_hicl) * torch.mm(
                     self.hicl_dg_encoder(x_flat),
                     self.hicl_prototypes.t(),
-                )
+                ))
 
             # Graph-of-Tokens routing
             if self._should_compute_aux_head(self.sparse_gate_got, 'got'):
                 with torch.no_grad():
                     got_clusters = self.got_graph_builder(x)
                 got_logits = self.got_cluster_proj(x_flat)
-                logits = logits + (self.w_got * YvNumericalGuard.straight_through_gate(
-                    self.sparse_gate_got)) * got_logits
+                logits = logits + self._resonant_head_contribution(logits, self.w_got * YvNumericalGuard.straight_through_gate(
+                    self.sparse_gate_got) * got_logits)
 
             # SoftMoE routing
             if self._should_compute_aux_head(self.sparse_gate_soft_moe, 'soft_moe'):
@@ -366,16 +395,16 @@ class YvMoEGate(nn.Module):
                 soft_weights = torch.sigmoid((logits_k - threshold) / self.soft_moe_temperature)
                 soft_logits = soft_weights * logits_v.softmax(dim=-1)
                 soft_logits = YvNumericalGuard.safe_div(soft_logits, soft_logits.sum(dim=-1, keepdim=True))
-                logits = logits + (self.w_soft * YvNumericalGuard.straight_through_gate(
-                    self.sparse_gate_soft_moe)) * soft_logits
+                logits = logits + self._resonant_head_contribution(logits, self.w_soft * YvNumericalGuard.straight_through_gate(
+                    self.sparse_gate_soft_moe) * soft_logits)
 
             # Expert-Oriented routing
             if self._should_compute_aux_head(self.sparse_gate_expert_orient, 'expert_orient'):
                 input_emb = self.input_encoder(x_flat)
                 encoded_expert = self.expert_capability_encoder(self.expert_embeddings)
                 sim_logits = torch.mm(input_emb, encoded_expert.t())
-                logits = logits + (self.w_expert_orient * YvNumericalGuard.straight_through_gate(
-                    self.sparse_gate_expert_orient)) * sim_logits
+                logits = logits + self._resonant_head_contribution(logits, self.w_expert_orient * YvNumericalGuard.straight_through_gate(
+                    self.sparse_gate_expert_orient) * sim_logits)
 
         # === Step 3: Modal-aware affinity bias ===
         if modal_id is not None:

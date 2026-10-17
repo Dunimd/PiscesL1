@@ -316,10 +316,20 @@ class YvConfig:
     moe_z_loss_alpha: float = 1e-4
     moe_random_to_gradient_steps: int = 500
     #: Which auxiliary routing heads may contribute to the logits, comma separated
-    #: (`hicl`, `got`, `soft_moe`). A tier can narrow the set: the heads are the most
-    #: expensive per-step terms on a CPU host and the set is the lever for attributing
-    #: a graph problem to one of them (docs/audit/00 §80/§82).
+    #: (`hicl`, `got`, `soft_moe`). A tier can narrow the set (docs/audit/00 §80/§82).
     moe_aux_routing_heads: str = "hicl,got,soft_moe"
+    #: Amplitude of an auxiliary head's contribution, expressed **relative to the main gate's
+    #: own logit spread**. Measured at step 0 on the host tier, the HiCL term's RMS is ~0.4%
+    #: of the main gate's (2.09e-03 vs 5.20e-01), far too small to flip a hard top-k, so the
+    #: heads shifted logits below selection resolution and were unobservable in every A/B
+    #: (docs/audit/00 §97/§99). A head scaled by this factor is commensurate with the gate it
+    #: advises, which is the same reasoning as the RPI trace scale in docs/proofs/04.
+    #: 0.0 restores the previous (inert) behaviour; 1.0 makes the head as loud as the gate.
+    #: Shipped at 0.0 on purpose: measured on this tier, rescaling a head to 0.25 of the main
+    #: gate's spread still left the router's returned weights and expert indices bit-identical
+    #: while the head parameters did receive a gradient (docs/audit/00 §100) - the output is
+    #: insensitive to the score for a reason that is not yet established, so no unproven
+    #: behaviour change goes on by default.
     moe_gate_warmup_alpha: float = 0.05
     moe_attention_mamba_temp: float = 0.3
     moe_layers: List[int] = field(default_factory=list)
