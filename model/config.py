@@ -256,8 +256,10 @@ class YvConfig:
         enable_cognitive_density (bool): Whether to enable cognitive density optimization for all 64 experts. Defaults to True.
         enable_dynamic_capacity (bool): Whether to enable dynamic capacity scaling for balanced loading. Defaults to True.
         cognitive_enhancement_scale (float): Scale factor for cognitive enhancement. Defaults to 0.1.
-        expert_temperature_max (float): Maximum routing temperature for exploration. Defaults to 5.0.
-        expert_load_balance_threshold (float): Threshold for load imbalance warnings. Defaults to 0.15.
+        moe_balance_entropy_floor (float): Routing-entropy ratio below which the
+            stable gate injects exploratory noise. Defaults to 0.7.
+        moe_load_balance_threshold (float): Imbalance score above which the
+            standard gate applies its load-balancing correction. Defaults to 0.15.
         expert_init_method (str): Expert initialization method ('hybrid', 'random', 'cluster'). Defaults to 'hybrid'.
         diversity_weight (float): Weight for diversity loss in knowledge density optimization. Defaults to 0.01.
         mi_weight (float): Weight for mutual information loss in knowledge density optimization. Defaults to 0.1.
@@ -330,6 +332,7 @@ class YvConfig:
     #: while the head parameters did receive a gradient (docs/audit/00 §100) - the output is
     #: insensitive to the score for a reason that is not yet established, so no unproven
     #: behaviour change goes on by default.
+    moe_aux_head_resonance: float = 0.0
     moe_gate_warmup_alpha: float = 0.05
     moe_attention_mamba_temp: float = 0.3
     moe_layers: List[int] = field(default_factory=list)
@@ -456,8 +459,8 @@ class YvConfig:
     enable_cognitive_density: bool = True
     enable_dynamic_capacity: bool = True
     cognitive_enhancement_scale: float = 0.1
-    expert_temperature_max: float = 5.0
-    expert_load_balance_threshold: float = 0.15
+    moe_balance_entropy_floor: float = 0.7
+    moe_load_balance_threshold: float = 0.15
 
     expert_init_method: str = "hybrid"
     diversity_weight: float = 0.01
@@ -999,7 +1002,7 @@ class YvConfig:
     classifier_dropout: float = 0.1  # model/core/model.py:2773
     moe_routing_temperature: float = 3.0  # model/moe/gate.py:177
     moe_temperature_min: float = 1.5  # model/moe/gate.py:178
-    moe_temperature_max: float = 5.0  # model/moe/gate.py:179
+    moe_temperature_max: float = 5.0  # consumed by YvMoEGate through cfg.moe_temperature_max
     moe_bias_update_rate: float = 0.05  # model/moe/hicl_router.py:140
     moe_dropout: float = 0.0  # model/moe/layer.py:682
     max_gpu_experts: int = 4  # model/moe/layer.py:707

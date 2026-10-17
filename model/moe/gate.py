@@ -771,7 +771,7 @@ class YvMoEGate(nn.Module):
                 torch.var(usage_distribution),
                 torch.max(nonzero_usage),
                 torch.min(nonzero_usage),
-                self.expert_temperature_max if hasattr(self.expert_temperature_max, 'data') else torch.tensor(float(self.expert_temperature_max)),
+                self.expert_temperature_max,
                 self.temperature
             ])
             load_variance, max_usage, min_usage, max_temp, current_temp = stats_tensor.tolist()
@@ -1002,7 +1002,8 @@ class YvStableMoEGate(nn.Module):
     
     def __init__(self, hidden_size, num_experts, top_k=2, device=None, dtype=None,
                  capacity_factor=1.0, min_capacity=4, prediction_horizon=10, 
-                 fixed_shape_mode=False, enable_dynamic_capacity=True, enable_cognitive_density=False):
+                 fixed_shape_mode=False, enable_dynamic_capacity=True, enable_cognitive_density=False,
+                 balance_entropy_floor=0.7):
         """Initialize the stable MoE gate.
         
         Args:
@@ -1023,6 +1024,9 @@ class YvStableMoEGate(nn.Module):
                 adjustment based on prediction. Default: True.
             enable_cognitive_density (bool): Enable cognitive density
                 enhancement for complex routing. Default: False.
+            balance_entropy_floor (float): Normalized routing-entropy ratio
+                below which exploratory noise is injected into the logits.
+                Default: 0.7.
         """
         super().__init__()
         self.gate = nn.Linear(hidden_size, num_experts, bias=False, device=device, dtype=dtype)
@@ -1034,6 +1038,7 @@ class YvStableMoEGate(nn.Module):
         self.fixed_shape_mode = fixed_shape_mode
         self.enable_dynamic_capacity = enable_dynamic_capacity
         self.enable_cognitive_density = enable_cognitive_density
+        self.balance_entropy_floor = balance_entropy_floor
         
         if self.enable_dynamic_capacity:
             self.complexity_predictor = nn.Sequential(
@@ -1311,7 +1316,7 @@ class YvStableMoEGate(nn.Module):
             logits = logits + load_adjustment.unsqueeze(0)
             
             # Add noise if the load is unbalanced (disabled during checkpointing)
-            if balance_ratio < 0.7:
+            if balance_ratio < self.balance_entropy_floor:
                 noise_scale = 0.1 * (1.0 - balance_ratio)
                 noise = torch.randn_like(logits) * noise_scale
                 logits = logits + noise
@@ -1614,13 +1619,9 @@ class YvMoELayer(nn.Module):
                 prediction_horizon=getattr(cfg, 'moe_prediction_horizon', 10),
                 fixed_shape_mode=fixed_shape_mode,
                 enable_dynamic_capacity=getattr(cfg, 'enable_dynamic_capacity', True),
-                enable_cognitive_density=getattr(cfg, 'enable_cognitive_density', False)
+                enable_cognitive_density=getattr(cfg, 'enable_cognitive_density', False),
+                balance_entropy_floor=getattr(cfg, 'moe_balance_entropy_floor', 0.7)
             )
-            # Pass configuration parameters to the gate
-            if hasattr(self.gate, 'expert_temperature_max'):
-                self.gate.expert_temperature_max = getattr(cfg, 'expert_temperature_max', 5.0)
-            if hasattr(self.gate, 'expert_load_balance_threshold'):
-                self.gate.expert_load_balance_threshold = getattr(cfg, 'expert_load_balance_threshold', 0.15)
         else:
             self.gate = YvMoEGate(
                 cfg.hidden_size, self.num_experts, top_k=self.top_k,
@@ -1628,6 +1629,7 @@ class YvMoELayer(nn.Module):
                 load_balance_alpha=getattr(cfg, 'moe_load_balance_alpha', 0.01),
                 noise_std=getattr(cfg, 'moe_noise_std', 0.1),
                 enable_cognitive_density=getattr(cfg, 'enable_cognitive_density', False),
+                load_balance_threshold=getattr(cfg, 'moe_load_balance_threshold', 0.15),
                 cfg=cfg,
             )
         

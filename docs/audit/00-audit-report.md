@@ -3460,3 +3460,102 @@ gsm8k 变成**工具调用监督数据**，并顺手修掉一个使这份语料�
 
 因此新基线自 375 起算；继续同配置堆步**不作为进展**（§101 的判定仍然有效），
 下一分派遣给 M4 的数据面与 M5 的查算分离可执行验证。
+
+## §107｜撤回我登记的 A88′机制，并修掉它背后那条真实缺陷：声明的配置到不了任何门（2026-10-17）
+
+**先撤回**：§88 把 A88′ 写成"容器门里 `self.gate.expert_temperature_max = <float>` 顶掉一个已注册
+buffer，于是该量掉出 `state_dict()`"。**机制是错的**，错在我没读赋值目标那一行属于哪个类：
+`model/moe/gate.py:1620-1623` 位于 `YvMoELayer` 的 `elif use_stable_gate:` 分支，`self.gate` 是
+`YvStableMoEGate`，而该类**从头到尾没有 `expert_temperature_max`、也没有 `expert_load_balance_threshold`**
+（这两个名字只在 `YvMoEGate` 里出现：注册于 245、消费于 403/774）。所以 `hasattr` 恒为**假**、
+整段"Pass configuration parameters to the gate"是**死代码**，一次也没执行过——
+不存在 float 覆写 buffer，也不存在张量掉出 `state_dict()`。
+同理 774 的 `hasattr(self.expert_temperature_max, 'data') else torch.tensor(float(...))`
+是给一个**不可能发生**的状态写的防御分支，一并删掉。
+
+**真实缺陷（这才是该修的）**：`configs/model/*.yaml` 声明的 MoE 阈值与门实际使用的值之间**没有通路**。
+逐条读码确认（不再靠推断）：
+
+| 声明处 | 消费处 | 实测 |
+|---|---|---|
+| `YvConfig.expert_temperature_max`（与 `moe_temperature_max` 是**同一个量的两个名字**） | 只有那段死代码 | 值从不生效 |
+| `YvConfig.expert_load_balance_threshold` | 只有那段死代码 | 值从不生效 |
+| `YvMoEGate.load_balance_threshold` 构造参数默认 `0.15`（消费于 622/624） | 容器构造 `YvMoEGate` 时**没传**该参数 | cfg 到不了，恒为 0.15 |
+| 稳定门的熵比例阈值 `0.7`（原 1314 行） | 硬编码魔法数 | 无处声明 |
+
+`configs/train/default.yaml:65` 还写着 `expert_temperature_max: 5.00`，而模型配置写 `moe_temperature_max: 3.0`
+——**同一个量两个名字、两处值、只有一条路径真被读**，正是指令书 §4.7（禁硬编码）与 §4.6（DRY）
+要防的形状，也属 A23"旗标静默半忽略"同族。
+
+**修（单名口径，不留别名）**：删掉 `expert_temperature_max`/`expert_load_balance_threshold` 两个字段
+（含 docstring、stage 默认值表 `tools/train/config.py`、两份映射 `tools/train/orchestrator.py`、
+`configs/train/default.yaml`）；改为 `moe_load_balance_threshold: 0.15` 与 `moe_balance_entropy_floor: 0.7`
+两个**各有其主**的声明字段，分别经构造参数进入 `YvMoEGate`（失衡分数阈值）与
+`YvStableMoEGate`（探索噪声注入的熵比例下限）——注意这两者语义不同，不合并为一个字段：
+前者比的是 `var(usage)/ideal`，后者比的是归一化路由熵。顺带更正 `moe_temperature_max`
+那行注释里指向已失效行号的 `model/moe/gate.py:179`。
+
+**证据（真模型、真值，非读码推断）**：`YvConfig()` 上设 `moe_balance_entropy_floor=0.42`、
+`moe_load_balance_threshold=0.33`，构造两层 `YvMoELayer`：稳定门读到 `floor=0.42`、
+标准门读到 `thr=0.33`（改前两处恒为默认值）；标准门的 `gate.expert_temperature_max`
+仍在 `state_dict()` 中（`['gate.temperature','gate.expert_temperature_max']`），
+故该变体的既有检查点与 A84 几何闸无冲突。链上用的是稳定门，其检查点本来就不含该 buffer，
+本次改动**不新增也不删除任何 state_dict 键**。
+
+**诚实定性**：默认声明下（0.7 / 0.15 / 3.0）数值行为**等价**，这是配置真实性修复，
+不是能力改进，不宣称任何 CE 变化；曲线判读基线不变（仍为 §106 的 375/8.9261）。
+
+**顺带关闭 A24**：`manage.py train --config configs/train/pretrain_cpu.yaml` 实测
+`REAL_EXIT=1`（退出码在管道外单独取，不再用 `cmd | grep` 的尾部码），
+`[ERROR] ... No model.txt found` 之后由 `tools/train/orchestrator.py:1051` 的
+`raise SystemExit(1)` 终止——致命配置错误不再返回 0，A24 据证从在册缺陷中移除。
+
+**同一把尺子量到自己身上（顺带修）**：checker 在整改后的全仓扫描里报
+`NO-UNDECLARED-CONFIG-READ: model/moe/gate.py:274 reads undeclared config key 'moe_aux_head_resonance'`。
+读码确认这不是历史存量而是**我自己在 §100/§103 留下的残账**：`model/config.py` 里
+`moe_aux_head_resonance` 的 `#:` 说明块（320-334 行，含"shipped at 0.0"的完整论证）**只有注释没有字段**
+——字段行在某次编辑中丢了，于是这个"辅助头相对响度"旋钮谁都设不了，`gate.py:273` 的
+`getattr(cfg, 'moe_aux_head_resonance', 0.0)` 恒取默认值。与 §107 同族：声明与消费断链。
+补回 `moe_aux_head_resonance: float = 0.0`（紧接其说明块），仍按 §100 的实测结论保持惰性，
+不借补声明偷偷改变行为。整改后 `errors 4087 → 4085`（§107 的两处魔法数 + 本条声明断链各归位，
+新增零处；`warnings` 仍为 0，`moe_aux_head_resonance` 的 `NO-UNDECLARED-CONFIG-READ` 命中数实测为 0）。
+
+## §108｜登记 A98：思考流监督通路被四处闭合，导致 `thinking_head` 结构上不可能拿到梯度（本轮只取证，未改码）
+
+`§48` 早就定性过：0.01B 的 44.10M 元素里两个 `thinking_head.weight` 各 9,705,344，
+占 **44%**，却"因当前语料无推理 span 标注而梯度为 0"。本轮把这句话**从推测升级为证明**——
+逐点读码确认阻断不在语料，而在**通路本身**，即补了 span 标注也照样不通：
+
+1. `model/core/model.py:1327`（惰性初始化）与 `:1629`（`resize_vocab` 之后）都调用
+   `self.reasoner.initialize_reasoning_tokens(None)`；`multipath_core.py:320-334` 收到 `None`
+   就走 `_set_default_reasoning_tokens()`，把 span 标记词元设为 `vocab_size-5..-1`。
+   同时该方法文档要求 tokenizer "exposing `convert_tokens_to_ids`"，而 **`YvTokenizer` 没有这个方法**
+   （只有 `convert_ids_to_tokens`，`tokenizer.py:692`）——即便传入真 tokenizer 也会抛异常，
+   所以这条分支从未可用。
+2. `model/reasoning/reasoner/unified.py:424-427` 把**注意力掩码当作 token id**：
+   `if attention_mask.dtype in (long,int32,int64): input_ids_tokens = attention_mask`，
+   随后 `:442-446` 以 `input_ids=input_ids_tokens` 调 `multi_path_core.forward`。
+   而 `tools/data/dataset/raw_text.py:275-279` 产出的掩码只有 0/1。
+3. `multipath_core.py:718-740` 的 `_create_reasoning_masks` 只按
+   `input_ids == self.reasoning_tokens[...]` 的前缀和判 span，于是拿 `{0,1}` 去比
+   `vocab_size-5..-1`，`masks[...]` 全假 → `:960` 的
+   `span_mask = mask[:, :-1] & (shift_labels != IGNORE_INDEX)` **恒为空**，
+   `:961` 直接 `return`，流内交叉熵 `:964` 从不执行。
+4. `tools/train/core.py:2041` 在训练批次里 `setdefault("return_reasoner_outputs", False)`，
+   `model.py:2477` 因此**根本不走 reasoner 前向**；`cot_memory.py:207/432` 是第二份
+   `thinking_head`，`unified.py:438-439` 给它填的是 `loss = 0.0`。
+
+**判据**：以上四点任一不打开，"给语料加推理 span"都不会改变 `thinking_head.grad is None` 的事实；
+四点全打开才谈得上监督。`tools/test/` 里没有任何套件断言 span 监督
+（`test_reasoner_shapes.py:122` 传 `input_ids=None`，`:127` 还**期望**没有流内 CE 项），
+所以这条通路坏着也无人报警——属指令书禁令 #1「盲删/半成品」的反面：**沉默的死通路**。
+
+**修复口径（下一步执行，避免边改边猜）**：标记词元必须来自真 tokenizer 的已注册特殊词
+（`tokenizer/tokenizer.json` 的 `added_tokens` 里已有 `<think>`/`</think>`，
+`YvTokenizer._prepare_special_tokens`（`tokenizer.py:269-302`）读 `tokenizer_config.json`
+的 `extra_special_tokens`，查询 API 是 `get_special_token_id`（`:468`）——注意现声明的
+`<|start_hypothesis|>` 一族**只写在 README.md:58，词表里根本没有**）；
+`unified.py` 必须收真 `input_ids` 而不是掩码；训练期 reasoner 前向要由"批次里存在 span 标记"
+驱动，而不是一个新旗标。数据侧沿用 `tool_trace.py:75-83` 的先例：文档形状与运行时解析同源。
+取证与判据在案，本轮**不动这批源码**（stage-10 与 checker 正在跑，遵守"跑测试期间不改源码"）。
+

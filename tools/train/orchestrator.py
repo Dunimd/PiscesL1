@@ -819,8 +819,8 @@ class PiscesLxTrainOrchestrator(PiscesLxBaseOperator):
             "routing_temperature": "moe_routing_temperature",
             "temperature_min": "moe_temperature_min",
             "temperature_max": "moe_temperature_max",
-            "expert_temperature_max": "expert_temperature_max",
-            "expert_load_balance_threshold": "expert_load_balance_threshold",
+            "load_balance_threshold": "moe_load_balance_threshold",
+            "balance_entropy_floor": "moe_balance_entropy_floor",
             "aux_routing_heads": "moe_aux_routing_heads",
         }
         for src_key, dst_key in mapping.items():
@@ -847,8 +847,8 @@ class PiscesLxTrainOrchestrator(PiscesLxBaseOperator):
             "moe_routing_temperature": "routing_temperature",
             "moe_temperature_min": "temperature_min",
             "moe_temperature_max": "temperature_max",
-            "expert_temperature_max": "expert_temperature_max",
-            "expert_load_balance_threshold": "expert_load_balance_threshold",
+            "moe_load_balance_threshold": "load_balance_threshold",
+            "moe_balance_entropy_floor": "balance_entropy_floor",
         }
 
         for src_key, dst_key in mapping.items():

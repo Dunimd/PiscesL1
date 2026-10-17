@@ -702,8 +702,8 @@ class PiscesLxTrainingConfig:
         "routing_temperature": 1.30,
         "temperature_min": 0.80,
         "temperature_max": 3.00,
-        "expert_temperature_max": 5.00,
-        "expert_load_balance_threshold": 0.15,
+        "load_balance_threshold": 0.15,
+        "balance_entropy_floor": 0.70,
     })
     kfac: Dict[str, Any] = field(default_factory=lambda: {"enabled": True})
     multitask: Dict[str, Any] = field(default_factory=lambda: {"enabled": True})
