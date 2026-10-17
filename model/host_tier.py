@@ -62,6 +62,16 @@ FLASH_ATTENTION_MIN_COMPUTE_CAPABILITY: Tuple[int, int] = (8, 0)
 #: A CPU host cannot satisfy the accelerator throughput target; the tier says so once.
 CPU_TOKS_PER_SECOND_TARGET = 1500.0
 
+#: TEMPORARY (2026-10-17, docs/audit/00 §80): schedule thresholds expressed in optimiser
+#: steps are unreachable on the host tier, where one window is 25-30 steps and a whole
+#: chain reaches a few hundred. The MoE auxiliary routing heads therefore never switched
+#: on under `--resume_ckpt`, and their parameters could not enter training at all
+#: (§79). The cpu tier downshifts the *existing* declared field to a value its own
+#: windows can cross; accelerator tiers keep the configured schedule untouched.
+#: This must be revisited when the run is no longer host-bound - it is a reachability
+#: fix for measurements on this tier, not a claim about the flagship schedule.
+CPU_SCHEDULE_DOWNSHIFT_STEPS = 150
+
 
 class YvHostTierError(RuntimeError):
     """Raised when a configuration contradicts the device it is about to run on."""
@@ -101,6 +111,34 @@ class YvHostTier:
             "flash_attention": self.supports_flash_attention,
             "host_ceiling": self.enforce_host_memory_ceiling,
         }
+
+
+    def apply_host_schedule(self, config: Any) -> List[str]:
+        """Make step-counted schedules reachable on this tier; return what was changed.
+
+        Only the ``cpu`` tier acts, and only on fields the model config already declares,
+        so this stays a tier policy rather than a new switch. Accelerator tiers return an
+        empty list and keep the authored schedule.
+
+        Args:
+            config: A model configuration exposing ``moe_random_to_gradient_steps``.
+
+        Returns:
+            List of ``"field: old -> new"`` descriptions, empty when nothing changed.
+        """
+        if self.name != "cpu":
+            return []
+        changed: List[str] = []
+        current = getattr(config, "moe_random_to_gradient_steps", None)
+        if isinstance(current, int) and current > CPU_SCHEDULE_DOWNSHIFT_STEPS:
+            config.moe_random_to_gradient_steps = CPU_SCHEDULE_DOWNSHIFT_STEPS
+            changed.append(
+                f"moe_random_to_gradient_steps: {current} -> {CPU_SCHEDULE_DOWNSHIFT_STEPS}")
+        if changed:
+            self.notes.append(
+                "host schedule downshift applied (TEMPORARY, docs/audit/00 §80): "
+                + "; ".join(changed))
+        return changed
 
 
 class YvHostTierResolver:

@@ -196,9 +196,11 @@ class YvMoEGate(nn.Module):
 
         # === Auxiliary routing heads (conditionally built) ===
         self._routing_heads_enabled = False
-        self._routing_head_warmup_steps = max(
-            getattr(cfg, 'moe_random_to_gradient_steps', 2000) if cfg is not None else 2000,
-            500
+        # The threshold is honoured as configured: the host tier expresses a warmup shorter
+        # than 500 steps on purpose (§80), and a floor here would silently make that
+        # downshift a no-op. Only the no-config fallback keeps a conservative default.
+        self._routing_head_warmup_steps = (
+            getattr(cfg, 'moe_random_to_gradient_steps', 500) if cfg is not None else 500
         )
 
         # HiCL DG-gated routing

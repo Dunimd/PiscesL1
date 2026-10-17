@@ -826,6 +826,14 @@ class PiscesLxTrainingOperator(object):
         # commit once died with `DefaultCPUAllocator: not enough memory` — docs/audit A25).
         # The parameter count comes from the meta-device probe in step 1, so the requirement
         # scales with what is about to be built rather than with the declared ceiling.
+        # Step-counted schedules that this tier cannot reach are downshifted *before* the model
+        # is constructed: the MoE routing heads read their warmup threshold in __init__, so
+        # applying it afterwards would be too late (docs/audit/00 §80, temporary host policy).
+        if self.host_tier is not None:
+            for item in self.host_tier.apply_host_schedule(model_kwargs.get("cfg")):
+                _LOG.warning(
+                    f"Host tier '{self.host_tier.name}' schedule downshift (TEMPORARY): {item}")
+
         self.reserve_host_memory_for_build(_total_params)
 
         # Step 2a: handle CPU init path cache load (non-meta, quant+lora)
