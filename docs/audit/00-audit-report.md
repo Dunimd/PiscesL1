@@ -2617,3 +2617,36 @@ seq 128 的第二个窗口**继续下降** —— 同一条链上唯一变量是
 自我对照用**真实源码**做：从 `initialize_model` 里删掉那一行闸门，扫描必须立刻报出该点 ——
 删掉前它判不出任何东西，说明这项检查不是空的。
 `manage.py test --stage 10` 现为 **18 套全绿**；`tools/check` 错误数 **4009** 无新增。
+
+### §79｜A85 MoE 辅助路由头在跨窗口续训下永久不可达（源码修复，2026-10-17）
+
+**缺陷（两层，缺一不可）**：`model/moe/gate.py` 用**模块自己的计数器** `current_step`
+决定何时启用辅助路由头（HiCL / Graph-of-Tokens / SoftMoE，行 315-320），阈值为
+`_routing_head_warmup_steps`（实测 0.01B 档 **2000**）。
+① 该计数器**不是 buffer、不进 state_dict**，因此每个新进程都从 0 重数 —— 而本机的真实运行方式
+就是跨窗口 `--resume_ckpt`，链条走到 step 225，计数器却反复归零；
+② 触发条件写成 `current_step == warmup_steps`（**相等**），只要计数器被任何方式**跨过**阈值就永远
+不 latch。两者叠加：`sparse_gate_hicl/got` 与 `w_hicl/w_got` **在任何续训链条上都不可能拿到梯度**
+——这正是 `verify_checkpoint` 里 66 个未更新张量的一部分，不是"特性未启用"。
+
+**修法**：① `YvModel.adopt_training_progress(global_step)`（`model/core/model.py`）把运行的**权威步数**
+下发给所有自带步数计数器的模块（只前进不后退）；训练器在 `load_checkpoint` 恢复 `global_step` 之后
+立即调用；② 门闩改成单调形式 `if not enabled and current_step >= warmup_steps`。
+闸门本身（值中性的 `straight_through_gate` 乘子，A55 留下的机制）不动。
+
+**实测（同一个 17.20M 真模型，前后对照）**
+| 状态 | `w_hicl.grad` (gate0/gate1) | `w_got.grad` (gate0/gate1) |
+|---|---|---|
+| 新进程、未下发步数 | **None / None** | **None / None** |
+| `adopt_training_progress(2001)` 后一次前向+反向 | -2.93e-05 / 6.45e-06 | -9.55e-05 / -4.85e-04 |
+
+`_routing_heads_enabled` 由 False 变 True，`_should_compute_aux_head` 的判定同步从 False 变 True。
+**过程中我自己下错过一次读数**：第一次对照探针仍是 None，因为我把 `_routing_heads_enabled` 手动重置
+成 False 却没再走一次前向（latch 在 forward 内），并且把 `enabled` 打印在前向之前。
+**判据：latch 类状态必须在触发它的那次前向之后再读。**
+
+**诚实边界**：修复解决的是"步数不下发 + 相等门闩"，**它不会让本机当前链条立刻变好** ——
+0.01B 档阈值是 2000 步，本机链条现在 225 步，`adopt(225)` 仍低于阈值，
+所以这轮的未更新张量数**不变**（仍是 66）。要让它在本机可见，必须要么把
+`moe_random_to_gradient_steps`/warmup 按**主机档位**降档（属档位契约，需先定口径），
+要么在有算力处达到 2000 步。**不得把机制修好说成指标改善。**

@@ -316,7 +316,10 @@ class YvMoEGate(nn.Module):
             self.current_step += 1
             if self.current_step > self.random_to_gradient_steps:
                 self.use_random_routing = False
-            if self.current_step == self._routing_head_warmup_steps:
+            # Latching on equality means the heads never switch on once the counter passes the
+            # threshold - and the threshold is crossed in one jump whenever progress is adopted
+            # from the run's global step after a resume (docs/audit/00 §79).
+            if not self._routing_heads_enabled and self.current_step >= self._routing_head_warmup_steps:
                 self._routing_heads_enabled = True
 
         # === Step 2: Compute logits (standard gate always) ===

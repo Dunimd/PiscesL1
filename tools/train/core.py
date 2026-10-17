@@ -3124,6 +3124,11 @@ class PiscesLxTrainingOperator(object):
         
         # Restore training state
         self.global_step = checkpoint.get('global_step', 0)
+        # Module-local step counters are not part of the state dict, so a resumed process would
+        # otherwise restart every warmup from zero and never activate the phases gated on them.
+        adopt = getattr(self.model, "adopt_training_progress", None)
+        if callable(adopt):
+            adopt(self.global_step)
         self.best_metric = checkpoint.get('best_metric', float('inf'))
         self.training_stats = checkpoint.get('training_stats', {})
         

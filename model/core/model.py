@@ -1515,6 +1515,20 @@ class YvModel(nn.Module):
         for name in self.LAZY_COMPONENTS:
             self._component_getter(name)()
 
+    def adopt_training_progress(self, global_step: int) -> None:
+        """Copy the run's authoritative step count into every module that counts steps.
+
+        A component-local counter restarts at zero in each process, so a run resumed across
+        windows never reaches its own warmup thresholds: the MoE auxiliary routing heads
+        stayed switched off for the whole chain and their parameters kept `grad is None`
+        (docs/audit/00 §79). The trainer's `global_step` is the only progress that survives
+        a resume, so it is pushed into the counters - never backwards.
+        """
+        for module in self.modules():
+            counter = getattr(module, "current_step", None)
+            if isinstance(counter, int) and global_step > counter:
+                module.current_step = global_step
+
     def to(self, device=None, dtype=None, non_blocking=False):
         if device is None and dtype is None:
             return super().to(device, dtype, non_blocking)
