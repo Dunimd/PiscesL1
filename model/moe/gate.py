@@ -202,6 +202,10 @@ class YvMoEGate(nn.Module):
         self._routing_head_warmup_steps = (
             getattr(cfg, 'moe_random_to_gradient_steps', 500) if cfg is not None else 500
         )
+        # Tier-declared subset of the auxiliary heads; comma separated, empty means none.
+        declared = str(getattr(cfg, 'moe_aux_routing_heads', 'hicl,got,soft_moe'))
+        self._aux_heads_allowed = frozenset(
+            name.strip() for name in declared.split(',') if name.strip())
 
         # HiCL DG-gated routing
         from .hicl_router import YvDGEncoder as _YvDG
@@ -287,7 +291,12 @@ class YvMoEGate(nn.Module):
         During early training (warmup), skips all auxiliary heads to save FLOPs.
         After warmup, computes only if the head hasn't been pruned and its
         sparse gate exceeds threshold. During inference, always computes if unpruned.
+        The tier-declared set `moe_aux_routing_heads` is checked first: it is how a host
+        tier opts out of an expensive head, and how one head is attributed in a failure
+        (docs/audit/00 §80/§82).
         """
+        if pruned_name not in self._aux_heads_allowed:
+            return False
         if pruned_name in self._pruned_heads:
             return False
         if not self.training:

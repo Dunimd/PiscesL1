@@ -315,6 +315,11 @@ class YvConfig:
     moe_expert_grad_clip: float = 0.1
     moe_z_loss_alpha: float = 1e-4
     moe_random_to_gradient_steps: int = 500
+    #: Which auxiliary routing heads may contribute to the logits, comma separated
+    #: (`hicl`, `got`, `soft_moe`). A tier can narrow the set: the heads are the most
+    #: expensive per-step terms on a CPU host and the set is the lever for attributing
+    #: a graph problem to one of them (docs/audit/00 §80/§82).
+    moe_aux_routing_heads: str = "hicl,got,soft_moe"
     moe_gate_warmup_alpha: float = 0.05
     moe_attention_mamba_temp: float = 0.3
     moe_layers: List[int] = field(default_factory=list)
