@@ -3222,3 +3222,32 @@ verify_checkpoint、模块导入探针和全仓 AST 检查**。窗口十二**单
 **待验证的替代解释（不当结论）**：若切断是**有意**的（例如路由分数只用于选择、
 权重按专家输出重新计算），那么这三个头连"选择"都没影响（本测逐位差 0.0），仍属死代码。
 两种情况下都要求修，只是修法不同。
+
+### §99｜撤回 §98：那条"结构死件"读数是我探针自己造的（第三次同类自失）
+
+**错在哪**：§98 的探针设了 `use_random_routing=False` 与 `random_to_gradient_steps=0`，
+但**没有同步改 `_routing_head_warmup_steps`**（它由 `moe_random_to_gradient_steps` 导出，该档 yaml 值 **2000**）。
+`YvMoEGate._should_compute_aux_head` 的判据是
+`if self.current_step < self._routing_head_warmup_steps: return False`（`gate.py:293-294`），
+而探针把 `current_step` 设成 **999 < 2000** ⇒ 三个头**在探针里被门控关掉了**。
+于是"头集合开/关输出逐位差 0.0""`w_hicl/w_got/w_soft` 梯度 None"
+全是**我自己造成的基线**，不是机制性质。**结论作废。**
+
+**这一点本可避免**：`_routing_head_warmup_steps` 与 `random_to_gradient_steps` 是**同一字段的两个用途**
+（§97 已经查出），我却只按其中一个去构造反证——正是本会话反复犯的那条：
+**改了一个开关就以为把整条通路都打开了。**
+
+**仍然成立的证据**（不依赖那个探针）：
+- §97 的干净 A/B 是在**真实流水线**里做的：两臂只差 `moe_aux_routing_heads` 声明、
+  同基座同序列长、各自单独运行，结果 `parameters_changed` 与未训练参数数**完全相同**、
+  每步耗时差在噪声内。⇒ 在真实链条上，这三个头的开/关**没有改变训练覆盖，也没有可测的成本代价**。
+- 但这**不等于**"头不进图"：A/B 里两臂都没到热身阈值以外的差异维度被证明，
+  它只证明"头开关不改变可测结果"。要判定头是否真的影响输出，
+  正确的探针必须**同时**满足：`current_step ≥ _routing_head_warmup_steps`、
+  `use_random_routing=False` 且 `current_step > random_to_gradient_steps`、`allowed` 集合非空。
+
+**重开该问题（判据已修正，写死为一条可跑断言）**：在同一几何下把
+`_routing_head_warmup_steps` 一并降到 150 再测头开/关对 `out[0]` 的逐位差与头参数梯度；
+**若逐位差仍为 0.0，才允许说"结构死件"**；若差非零，则 §98 撤销、
+LRRM 的成本动机维持 §97 的降级结论（次要动机）。
+本轮不做该实验，避免在更正未落地时再抛新结论。
