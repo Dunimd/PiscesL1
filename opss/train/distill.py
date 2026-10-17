@@ -94,6 +94,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import GradScaler, autocast
 
 from utils.dc import PiscesLxLogger
+from utils.state_geometry import PiscesLxStateGeometryGate
 from utils.paths import PiscesLxPaths
 from configs.version import VERSION
 from utils.opsc.interface import PiscesLxOperatorInterface, PiscesLxOperatorResult, PiscesLxOperatorStatus
@@ -463,9 +464,17 @@ class _PiscesLxDistillationOperatorImpl(PiscesLxOperatorInterface):
             ckpt_path = self.config.student_model_path
             if os.path.isfile(os.path.join(ckpt_path, "model.pt")):
                 state = torch.load(os.path.join(ckpt_path, "model.pt"), map_location="cpu")
+                # A student must start from the geometry it was configured with; a
+                # partially fitting checkpoint silently trains on random weights (§78).
+                PiscesLxStateGeometryGate.require_restorable(
+                    self.student_model, state, f"student checkpoint {ckpt_path}")
                 self.student_model.load_state_dict(state, strict=False)
             elif os.path.isfile(os.path.join(ckpt_path, "pytorch_model.bin")):
                 state = torch.load(os.path.join(ckpt_path, "pytorch_model.bin"), map_location="cpu")
+                # A student must start from the geometry it was configured with; a
+                # partially fitting checkpoint silently trains on random weights (§78).
+                PiscesLxStateGeometryGate.require_restorable(
+                    self.student_model, state, f"student checkpoint {ckpt_path}")
                 self.student_model.load_state_dict(state, strict=False)
 
             device = torch.device(f"cuda:{self.config.local_rank}" if torch.cuda.is_available() else "cpu")

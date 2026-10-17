@@ -37,14 +37,14 @@ test itself rather than reported as a pass.
 """
 
 import inspect
+from pathlib import Path
 from typing import List, Tuple
 
 from torch import nn
 import torch
 
 from tools.train.core import PiscesLxTrainingOperator
-from tools.train.orchestrator import PiscesLxTrainOrchestrator
-from tools.train.state_geometry import (
+from utils.state_geometry import (
     _MAX_REPORTED_KEYS,
     PiscesLxStateGeometryError,
     PiscesLxStateGeometryGate,
@@ -57,6 +57,13 @@ _WIDE = 9
 
 #: More samples than the gate is allowed to name, to prove the diagnosis truncates.
 _MANY_LAYERS = 12
+
+#: Lines above a load that may carry its gate call. A gate must sit directly in front of
+#: the load it protects; one anywhere in the file proves nothing.
+_GATE_LOOKBACK = 5
+
+#: Source directories whose code overwrites model weights and therefore needs the gate.
+_SCANNED_PACKAGES = ("model", "opss", "tools", "utils")
 
 
 class _PiscesLxProbeNet(nn.Module):
@@ -173,21 +180,58 @@ class PiscesLxStateGeometryContract:
                     self._cache_deletes_mismatched_keys(doctored),
                     "a doctored source is rejected, so the check is not vacuous")
 
-    def check_resume_and_orchestrator_gated(self) -> None:
-        """Every full-model restore site must pass the gate before it loads."""
+    @staticmethod
+    def _scan_lines(lines: List[str], name: str) -> List[str]:
+        """Flag every ``strict=False`` restore in ``lines`` lacking a gate directly above."""
+        offenders: List[str] = []
+        for index, line in enumerate(lines):
+            if "load_state_dict(" not in line or "strict=False" not in line:
+                continue
+            window = "".join(lines[max(0, index - _GATE_LOOKBACK):index + 1])
+            if "require_restorable" not in window:
+                offenders.append(f"{name}:{index + 1}")
+        return offenders
+
+    @classmethod
+    def _ungated_restores(cls, root: str = ".") -> List[str]:
+        """Name every model-level ``strict=False`` restore not preceded by the gate.
+
+        A `strict=False` load is only legitimate after the geometry gate: the gate owns
+        shapes, the load stays responsible for the key set (LoRA renaming is expected).
+        """
+        offenders: List[str] = []
+        for directory in _SCANNED_PACKAGES:
+            base = Path(root) / directory
+            if not base.is_dir():
+                continue
+            for path in sorted(base.rglob("*.py")):
+                if "test" in path.parts:
+                    continue
+                body = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                offenders.extend(cls._scan_lines(body, str(path)))
+        return offenders
+
+    def check_every_restore_repo_wide_is_gated(self) -> None:
+        """No weight-overwriting load may skip the gate, anywhere in the engine."""
+        offenders = self._ungated_restores()
+        self.record("wiring::every strict=False restore is gated",
+                    not offenders,
+                    f"ungated sites: {offenders[:3] or 'none'}")
+        gated = inspect.getsource(PiscesLxTrainingOperator.initialize_model).splitlines()
+        stripped = [line for line in gated if "require_restorable" not in line]
+        found = self._scan_lines(stripped, "resume")
+        self.record("wiring::scan catches an ungated load (self-control)",
+                    bool(found),
+                    f"removing the gate line from real source yields {found[:1] or 'nothing'}")
+
+    def check_resume_gated_before_strict_load(self) -> None:
+        """The trainer's resume path must diagnose geometry before the strict load."""
         resume = inspect.getsource(PiscesLxTrainingOperator.load_checkpoint)
         gate_index = resume.find("require_restorable")
         strict_index = resume.find("load_state_dict(state, strict=True)")
         self.record("wiring::resume gated before strict load",
                     0 <= gate_index < strict_index,
                     f"gate@{gate_index} load@{strict_index}")
-
-        orch = inspect.getsource(PiscesLxTrainOrchestrator)
-        loads = orch.count("model.load_state_dict(sd, strict=False)")
-        gates = orch.count("PiscesLxStateGeometryGate.require_restorable(model, sd,")
-        self.record("wiring::every orchestrator restore is gated",
-                    loads > 0 and loads == gates,
-                    f"{gates} gate(s) for {loads} load(s)")
 
     def run(self) -> int:
         """Execute every check; non-zero exit on any failure."""
@@ -197,7 +241,8 @@ class PiscesLxStateGeometryContract:
         self.check_diagnosis_truncates()
         self.check_empty_state_refused()
         self.check_cache_path_gated()
-        self.check_resume_and_orchestrator_gated()
+        self.check_every_restore_repo_wide_is_gated()
+        self.check_resume_gated_before_strict_load()
         failed = [name for name, ok, _ in self.results if not ok]
         for name, ok, detail in self.results:
             print(f"[{'PASS' if ok else 'FAIL'}] {name:<48} {detail}")

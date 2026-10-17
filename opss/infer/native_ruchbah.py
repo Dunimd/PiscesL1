@@ -31,6 +31,7 @@ import torch
 
 from utils.dc import PiscesLxLogger
 from utils.paths import PiscesLxPaths
+from utils.state_geometry import PiscesLxStateGeometryGate
 
 from configs.version import VERSION
 from utils.opsc.interface import PiscesLxOperatorInterface, PiscesLxOperatorResult, PiscesLxOperatorStatus
@@ -81,6 +82,9 @@ class PiscesLxNativeInferenceOperator(PiscesLxOperatorInterface):
                 state = raw
             if not isinstance(state, dict):
                 raise ValueError("checkpoint does not contain a state_dict")
+            # Inference must not serve a half-loaded network: a checkpoint from another
+            # geometry would leave the mismatched tensors at random init (docs/audit/00 §78).
+            PiscesLxStateGeometryGate.require_restorable(model, state, f"checkpoint {ckpt_path}")
             model.load_state_dict(state, strict=False)
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

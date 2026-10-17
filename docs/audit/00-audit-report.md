@@ -2603,3 +2603,17 @@ seq 128 的第二个窗口**继续下降** —— 同一条链上唯一变量是
 （致命错误返回 0）。实测用真实退出码量：**闸门拒绝时 `manage.py train` 返回 1**，
 那个 0 是管道里 `grep` 的退出码。**A24 仍然在册未修，但它不适用于这条路径** —— 判据要落到
 不带管道的 `$?`，不能读 `cmd | grep` 的状态。
+
+**同族收口（§78 补，2026-10-17 同日）**：闸门最初只接在训练侧 3 处，但全仓共有 **7 处**
+模型权重级 `strict=False` 恢复 —— 剩下 4 处更危险，因为它们在**出结果**的路上：
+`opss/infer/native_ruchbah.py`、`tools/infer/core.py`（推理引擎载入检查点）与
+`opss/train/distill.py` 两处（蒸馏学生初始化）。半加载的推理模型不会报错，只会**输出乱答案**。
+因此把闸门从 `tools/train/` 上移到 `utils/state_geometry.py`（`opss/` 不该依赖 `tools/`），
+4 处全部先过闸门；`utils.state_geometry` / 三个被改包与训练器均 smoke-import 通过。
+
+**把契约升级成全仓机检**：`test_state_geometry_contract` 现在扫描
+`model/ opss/ tools/ utils/` 四个包里的每一处 `strict=False` 权重恢复，要求**闸门就在加载语句之前**
+（回看 5 行；闸门写在文件别处不算保护）。实测**未受保护点：0**，共 10 项检查全过。
+自我对照用**真实源码**做：从 `initialize_model` 里删掉那一行闸门，扫描必须立刻报出该点 ——
+删掉前它判不出任何东西，说明这项检查不是空的。
+`manage.py test --stage 10` 现为 **18 套全绿**；`tools/check` 错误数 **4009** 无新增。

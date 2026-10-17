@@ -140,7 +140,7 @@ from contextlib import nullcontext
 from utils.dc import PiscesLxLogger, PiscesLxSystemMonitor
 
 from .config import PiscesLxTrainingConfig
-from .state_geometry import PiscesLxStateGeometryGate, PiscesLxStateGeometryError
+from utils.state_geometry import PiscesLxStateGeometryGate, PiscesLxStateGeometryError
 
 from utils.device import PiscesLxDeviceResolver
 from utils.host_memory import (

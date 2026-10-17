@@ -85,6 +85,7 @@ import json
 from datetime import datetime
 
 from utils.dc import PiscesLxLogger, PiscesLxSystemMonitor
+from utils.state_geometry import PiscesLxStateGeometryGate
 
 from .config import PiscesLxInferenceConfig
 from model import YvConfig, YvModelForCausalLM
@@ -223,6 +224,10 @@ class PiscesLxInferenceEngine(object):
                 else:
                     state = raw
                 if isinstance(state, dict):
+                    # Serving a half-loaded model is worse than refusing to start: tensors
+                    # that do not fit stay randomly initialised (docs/audit/00 §78).
+                    PiscesLxStateGeometryGate.require_restorable(
+                        self.model, state, f"checkpoint {ckpt_path}")
                     self.model.load_state_dict(state, strict=False)
                 _LOG.info(f"Loaded checkpoint from {ckpt_path}")
         
