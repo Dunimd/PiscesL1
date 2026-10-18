@@ -3174,7 +3174,30 @@ class PiscesLxTrainingOperator(object):
         if self.optimizer and checkpoint['optimizer_state_dict']:
             recorded_groups = len(checkpoint['optimizer_state_dict'].get('param_groups', []))
             current_groups = len(self.optimizer.param_groups)
-            if recorded_groups != current_groups:
+            if recorded_groups == current_groups:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            elif recorded_groups > current_groups:
+                # The extra groups are ones `_adopt_lazy_parameters` appended after the optimiser
+                # was built, so the leading groups still line up one-to-one with the checkpoint.
+                # Discarding the whole state here also threw away the moments of every original
+                # group - measured: a 2-group checkpoint resumed into a 1-group run lost all 437
+                # state entries (docs/audit/00 A105). Keep the prefix, drop only the tail.
+                saved = checkpoint['optimizer_state_dict']
+                kept_groups = saved.get('param_groups', [])[:current_groups]
+                kept_ids = {pid for group in kept_groups for pid in group.get('params', [])}
+                trimmed = {
+                    'state': {key: value for key, value in saved.get('state', {}).items()
+                              if key in kept_ids},
+                    'param_groups': kept_groups,
+                }
+                self.optimizer.load_state_dict(trimmed)
+                _LOG.warning(
+                    f"Resume kept the optimiser state for the first {current_groups} of "
+                    f"{recorded_groups} recorded group(s); the "
+                    f"{recorded_groups - current_groups} trailing group(s) were lazy components "
+                    "adopted in the previous run and restart here with zero moments."
+                )
+            else:
                 # An optimiser topology change (e.g. declaring `sparse_gate_lr_multiplier`) makes
                 # the recorded moments meaningless for the new grouping - torch raises
                 # "different number of parameter groups" and the whole resume dies. The weights are
@@ -3185,8 +3208,6 @@ class PiscesLxTrainingOperator(object):
                     f"Resume skipped the optimiser state: the checkpoint carries {recorded_groups} "
                     f"parameter group(s) but this run has {current_groups}. Weights were loaded; "
                     "the optimiser restarts from zero moments because the grouping changed.")
-            else:
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
         # Load scheduler state
         if self.scheduler and checkpoint['scheduler_state_dict']:

@@ -4070,3 +4070,27 @@ lm_head.weight                                  delta_norm = 0.007283
 **下一步（A98 之后才有意义的主线）**：在 0.1B/新几何上重开链基线并跑足够步数——旧几何产物已退役，
 CE 8.9261 只作旧链纯文本的历史读数；M4 的三模态与真实指令数据、P1 全部速度/评测指标（需 T4/启智）、
 A105（resume 不恢复优化器状态：本轮仍观察到条目回落）与 `special_tokens.py` 死声明清理继续在册。
+
+
+## §122｜A105 关闭：续跑不再丢弃全部优化器状态（前缀恢复），实测 437 条动量得以保留
+
+**更正我自己的一处读数**：先前记为"优化器条目 677→515"，其实 **677/515 是参数个数**，
+组数一直是 **2 → 1**（主组 + 惰性采纳组）。真实现象是：`recorded_groups=2`、`current_groups=1`
+时旧代码走 `!=` 分支**丢弃整份状态**（437 条 Adam 条目全丢），连原本那 1 组的动量一起作废。
+
+**修法**：`tools/train/core.py` 的恢复逻辑改成三分支——
+组数相等 → 正常加载；**记录的组更多 → 只取前缀**（`add_param_group` 是追加，前面各组与检查点逐位对齐）、
+按保留的参数 id 过滤 `state`、加载并 WARNING 点名"尾组是上次采纳的惰性组件，本次从零动量起步"；
+记录的组更少 → 维持原来"拓扑真变了就丢状态并大声说"的处理。
+中途两次自我破坏也记下来：我第一版把新分支写成不可达的 `elif`（被前面的 `!=` 全部吃掉），
+第二版用 heredoc 拼装因引号转义未写入；两版都已 `git checkout` 回退，最终以编辑器小步落地。
+
+**实测**：从 2 组检查点 `--resume_ckpt` 续跑 →
+`Resume kept the optimiser state for the first 1 of 2 recorded group(s); the 1 trailing group(s)
+were lazy components adopted in the previous run and restart here with zero moments.`，
+`TRAIN_EXIT=0`、`Loss: 32.9902`（仍是含 reasoner 的量级）。
+
+A98/A100/A101/A102/A103/A104/A105 至此全部有数字闭环；剩余在册：M4 三模态与真实指令数据、
+`special_tokens.py` 零消费者字段（含 `document_token` 禁令 #18 残留）、其余 18 条 `special=false`
+标记、clamp 静默改计数告警、契约测试"预设 vocab ≥ 分词器 id 空间"、静态 4094、
+以及**0.1B 新几何重开链基线 + P1 全部速度/评测指标（需 T4/启智）+ 权重双上传**。
