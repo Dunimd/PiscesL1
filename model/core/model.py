@@ -1330,6 +1330,51 @@ class YvModel(nn.Module):
             self.reasoner.initialize_reasoning_tokens(self._marker_tokenizer())
             self._lazy_initialized['reasoner'] = True
 
+    def _batch_has_reasoning_span(self, input_ids):
+        """Report whether this batch carries a registered reasoning marker.
+
+        Resolution reuses the engine's own stream table and the tokenizer's registered ids, so the
+        model can ask this question **before** deciding whether to build the engine at all. The
+        decision used to be "am I training", which materialised two 158M-parameter heads on runs
+        whose data contains no markers and killed the run out of memory.
+
+        Args:
+            input_ids: Token id tensor of shape [batch, seq], or None.
+
+        Returns:
+            bool: True when a registered marker id occurs in the batch.
+        """
+        if input_ids is None or not torch.is_tensor(input_ids) or input_ids.numel() == 0:
+            return False
+        marker_ids = self._reasoning_marker_ids()
+        if not marker_ids:
+            return False
+        markers = torch.tensor(sorted(marker_ids), device=input_ids.device, dtype=torch.long)
+        return bool(torch.isin(input_ids, markers).any())
+
+    def _reasoning_marker_ids(self):
+        """Return the registered marker ids of every reasoning stream, resolved once per model.
+
+        Returns:
+            frozenset: The ids of the markers named by ``YvSpecialTokens`` for each stream in
+                ``YvMultiPathReasoningEngine._STREAM_MARKERS``; empty when none are registered.
+        """
+        cached = getattr(self, "_reasoning_marker_cache", None)
+        if cached is not None:
+            return cached
+        from ..reasoning.reasoner.multipath_core import YvMultiPathReasoningEngine
+        from ..tokenizer.special_tokens import YvSpecialTokens
+        tokenizer = self._marker_tokenizer()
+        declared = YvSpecialTokens()
+        resolved = set()
+        for start_attr, end_attr in YvMultiPathReasoningEngine._STREAM_MARKERS.values():
+            for attr in (start_attr, end_attr):
+                marker_id = tokenizer.get_special_token_id(getattr(declared, attr))
+                if marker_id is not None:
+                    resolved.add(int(marker_id))
+        self._reasoning_marker_cache = frozenset(resolved)
+        return self._reasoning_marker_cache
+
     def bind_tokenizer(self, tokenizer) -> None:
         """Attach the project tokenizer so marker-conditioned training can resolve markers.
 
@@ -2498,28 +2543,27 @@ class YvModel(nn.Module):
             x = self.norm(x)
             logits = self.lm_head(x)
 
+            reasoner_input_ids = (
+                input_ids[:, :x.shape[1]]
+                if input_ids is not None and input_ids.shape[1] > x.shape[1]
+                else input_ids
+            )
             # Lazy-init reasoner and downstream modules.
-            # Materialising the engine during supervised training is what lets a batch that
-            # carries markers be supervised at all; the forward itself still only runs when a
-            # bound marker is present, so plain pretraining text pays no extra compute.
-            if return_reasoner_outputs or (self.training and labels is not None):
+            # Each thinking head is a hidden-by-vocab tensor - 158M parameters at the 0.1B tier -
+            # so materialising the engine on every supervised step made an ordinary pretraining
+            # run die out of memory before its first batch (docs/audit/00 section 114). Only a
+            # batch that actually carries a registered marker justifies paying that cost.
+            span_in_batch = (self.training and labels is not None
+                             and self._batch_has_reasoning_span(reasoner_input_ids))
+            if return_reasoner_outputs or span_in_batch:
                 self._lazy_get_reasoner()
             if return_verifier_outputs:
                 self._lazy_get_vericot()
             if return_tool_outputs:
                 self._lazy_get_seer()
 
-            reasoner_input_ids = (
-                input_ids[:, :x.shape[1]]
-                if input_ids is not None and input_ids.shape[1] > x.shape[1]
-                else input_ids
-            )
-            #: The thinking stream is supervised when the batch actually carries a bound marker,
-            #: not when a caller remembers to raise a switch.
             reasoner_out = None
-            if self.reasoner is not None and (return_reasoner_outputs or (
-                    self.training and labels is not None
-                    and self.reasoner.multi_path_core.has_reasoning_span(reasoner_input_ids))):
+            if self.reasoner is not None and (return_reasoner_outputs or span_in_batch):
                 reasoner_labels = (
                     labels[:, :x.shape[1]]
                     if labels is not None and labels.shape[1] > x.shape[1]
