@@ -4094,3 +4094,32 @@ A98/A100/A101/A102/A103/A104/A105 至此全部有数字闭环；剩余在册：M
 `special_tokens.py` 零消费者字段（含 `document_token` 禁令 #18 残留）、其余 18 条 `special=false`
 标记、clamp 静默改计数告警、契约测试"预设 vocab ≥ 分词器 id 空间"、静态 4094、
 以及**0.1B 新几何重开链基线 + P1 全部速度/评测指标（需 T4/启智）+ 权重双上传**。
+
+
+## §123｜新几何下的链基线规程（A102 之后必须重立口径，否则任何"进步"都不可比）
+
+旧链已退役到 `retired-151646-geometry/`，`vocab_size` 从 151646 抬到 154885 之后，
+**CE 8.9261 不再可作对照锚点**（它属于塌缩几何下的纯文本读数）。本节把新链的判读口径先钉死，
+避免"我拿不同数据混合的 loss 互相减"这种自伤。
+
+1. **两条独立的量，不得混减**：
+   - *留出集 CE*：只在本仓验证集 `data/corpus/wikitext__wikitext-2-raw-v1_validation-...jsonl` 上算，
+     用 `tools/dev/verify_checkpoint.py`，它是**纯文本**口径，用来判 LM 头是否进步；
+   - *训练 loss*：当语料含思考区间时，模型侧合成 `lm_loss + reasoner_loss`，量级 ~33 而非 ~12
+     （实测 33.1430 / 32.9902）。**这条曲线只能与"同样带 span 的 run"互比**，与纯文本 run 差 ~21
+     是 reasoner 项，不是退化。日志里出现 `streams bound to marker intervals` 即该 run 带 span。
+2. **A98 的检查在每个档位都要重做一次**，不因 0.01B 通过就外推：产物
+   `materialized_components` 含 `reasoner`、`model_state_dict` 含
+   `reasoner.multi_path_core.thinking_head.*`、且**两次窗口之间**该张量 `delta_norm > 0`
+   （比对前必须先看 `global_step` 增量 > 0，§121 的零步假象就出在这里）。
+3. **进步判据沿用 §101**：至少三点均值 + 极差；单点差小于窗口波动（历史上 ±0.12 nats）只能写"区间内摆动"。
+4. **续跑完整性**（A105 之后新增的硬检查）：每次 `--resume_ckpt` 后必须在
+   `logs/PiscesLx/Tools/output.log` 里读到 `kept the optimiser state`（或组数相等时的静默正常加载）。
+   若读到 `skipped the optimiser state`，该 run 的 Adam 动量整体归零，
+   **跨越这个边界的曲线不可比**，要在记录里标注边界，不能拿它当"停滞/回退"的证据。
+5. **几何闸不可绕**：A84 对行数不一致的检查点是**正确拒绝**，任何"逐键删掉再 strict 载入"的
+   做法一律禁止（§106 之前已除根）。要迁移动旧权重只能走显式 resize + 重开基线，并留下迁移记录。
+
+本轮只立规程、不产结论；0.1B / 154885 几何的第一条链（`E:/pisceslx-artifacts/chainA`，
+`--seq_len 256 --max_steps 60`，span 语料）正在跑，跑完按本节口径给出首点，并明确标注它是
+"带 reasoner 项的 loss 量级"，不与 8.9261 直接比较。
