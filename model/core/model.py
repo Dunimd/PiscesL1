@@ -1327,6 +1327,13 @@ class YvModel(nn.Module):
             from ..reasoning import YvUnifiedReasoner
             _LOG.debug("YvModel: lazy-init reasoner...")
             self.reasoner = YvUnifiedReasoner(self.cfg, device=self._device, dtype=self._dtype)
+            # The thinking stream projects to the *same* vocabulary and predicts the same target as
+            # the language model, so it gets the model's own output map instead of a second
+            # hidden-by-vocab matrix. Owning one per branch cost 158M parameters at the 0.1B tier
+            # (vocab 154885 x hidden) and made a span-bearing run die out of memory before its
+            # first logged step; after the A100 merge this was the last duplicate of that shape
+            # (docs/audit/00 section 124).
+            self.reasoner.multi_path_core.thinking_head = self.lm_head
             self.reasoner.initialize_reasoning_tokens(self._marker_tokenizer())
             self._lazy_initialized['reasoner'] = True
 
@@ -1705,6 +1712,10 @@ class YvModel(nn.Module):
         )
         new_lm_head.weight.data[:num_to_copy, :] = old_lm_head.weight.data[:num_to_copy, :]
         self.lm_head = new_lm_head
+        if self.reasoner is not None:
+            # The reasoning stream projects through this same output map; without the re-tie the
+            # engine would keep a reference to the discarded matrix.
+            self.reasoner.multi_path_core.thinking_head = self.lm_head
 
         if getattr(self.cfg, 'tie_word_embeddings', False):
             self.lm_head.weight = self.embed.weight

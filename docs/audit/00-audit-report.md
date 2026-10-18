@@ -4123,3 +4123,27 @@ A98/A100/A101/A102/A103/A104/A105 至此全部有数字闭环；剩余在册：M
 本轮只立规程、不产结论；0.1B / 154885 几何的第一条链（`E:/pisceslx-artifacts/chainA`，
 `--seq_len 256 --max_steps 60`，span 语料）正在跑，跑完按本节口径给出首点，并明确标注它是
 "带 reasoner 项的 loss 量级"，不与 8.9261 直接比较。
+
+
+## §124｜A100 的第二半：思考投影改为**共享 `lm_head`**，实测消除 0.1B 档 1.58 亿参数的重复 H×V 矩阵
+
+A100 只把两个头合成一个还不够：**剩下的那个头本身就是 `hidden × vocab`**，
+在 154885 词表下 0.1B 档约 **1.58 亿参数**，一条带 span 的链一物化 reasoner 就吃光本机闸门——
+`chainA`（0.1B / seq256）因此 **`CHAIN_EXIT=139`** 在首个 step 之前段错误，一条日志都没产出。
+
+思考流的监督目标是"同一个词表的下一个 token"，与 LM 输出映射**是同一个函数**，
+再养一份 H×V 矩阵属最典型的功能重叠，故按 §9"合并优先"改为**共享**而非新增：
+
+- `_lazy_get_reasoner`：`self.reasoner.multi_path_core.thinking_head = self.lm_head`（同一模块、同一 storage）；
+- `resize_vocab`：换掉 `lm_head` 后**重新绑定**，否则引擎会留着被丢弃的旧矩阵（静默错映射）。
+
+**实测**（0.01B，vocab 154885）：`TIE-CHECK same module: True`、`shared storage: True`、
+两个头形状均为 `(154885, 64)`；两次真实窗口后
+`lm_head.weight` 与 `reasoner.multi_path_core.thinking_head.weight` 在保存状态里
+**`torch.equal == True`**（tie 一直成立到落盘），且 **`delta_norm = 0.007945`（两键同步）**
+——即 span 损失确实经共享输出映射更新了权重，A98 在合并后仍然闭环。
+
+**如实记录**：第二次窗口在 step 3 抛 `MemoryError`（`R2=1`，步数只前进 1 而非 2），
+是主机内存耗尽而非逻辑错误——崩溃前 delta 已非零，说明被中断的是"继续跑"，不是"能不能训"。
+`0.1B` 档带 span 的链在本机仍不可行，属**资源结论**而非代码结论：需要 T4/启智级别显存/内存，
+这条已并入 P1 的算力前提。
