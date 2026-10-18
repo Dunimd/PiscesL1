@@ -4188,3 +4188,27 @@ A100 只把两个头合成一个还不够：**剩下的那个头本身就是 `hi
    本次两者皆空才敢下"未进入训练"的结论（此前我差点把 §121 的零步假象当成同一类）。
 
 E 盘仍 2.5GB 量级；两次的 `run.log`（0 字节与少量字节）留在 `chainA/chainB` 作为这次判据的原始证据。
+
+
+## §126｜按用户指示提前同步主仓库（偏离 AGENTS.md §13 的时机约定，留痕）与主仓库分叉的处置
+
+`AGENTS.md` §13 写的是"主仓库须待全部任务完成并通过验收后方可推送"。**2026-10-18 用户明确指示**
+"把本地的所有内容提交到 GitHub 和 gitee 上，不提交权重"，故按指示提前推送；任务未完成这一事实不变，
+本节的目的是让后来者知道主仓库此刻的"已同步"**不等于**验收通过。
+
+处置过程（全部非破坏，无 force push）：
+
+1. 推送前核查：工作树干净、**无任何权重被跟踪**（`git ls-files` 无 `.pt/.safetensors/.ckpt`）、
+   最大跟踪文件是词表工件 `tokenizer/tokenizer.json`（9.6 MB）。
+2. 主仓库被拒（non-fast-forward）：`gitee`/`github` 的 master 停在 **2026-07-11** 且其 ref 曾被
+   force 更新过，本仓有 **357** 个它们没有的提交。直接测试合并产生 **278 个冲突文件**（含 README、
+   `.gitignore` 等），整树对账式手工合并风险高于收益。
+3. 采用 `git merge -s ours` 把两主仓库的旧历史**记为祖先**（内容仍以本仓为准，
+   `git diff --stat HEAD^1 HEAD` 为空即证），随后普通推送成功：
+   `gitee f543b2e..52c0a09`、`github f4182e9..52c0a09`，再同步实验仓库
+   `gitee-exp/github-exp 8f486f2..52c0a09`。**上游历史一个提交都没丢，也未改写其历史。**
+4. 终态核验：四端 `merge-base --is-ancestor HEAD <remote>/master` 全为 OK，
+   `git diff gitee/master HEAD` 与 `git diff github/master HEAD` 均为空。
+5. 同时交付**交接提示词** `docs/prompts/HANDOFF_AGENT.md`：如何从 git 取仓库、必读顺序、
+   三关验收命令与读数纪律、已完成清单（A98/A100/A102/A105/A94 带数字）、T1-T6 待办与各自判据、
+   工作方式硬要求、代码地图、接手第一步。
