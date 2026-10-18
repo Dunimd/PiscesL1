@@ -2897,6 +2897,37 @@ class PiscesLxTrainingOperator(object):
         except Exception:
             pass
 
+    def _adopt_lazy_parameters(self) -> int:
+        """Give parameters created after the optimizer was built an optimizer group.
+
+        Reasoning components are materialised on the first batch that carries a thinking span
+        (docs/audit/00 section 119), which happens after the optimizer has been constructed;
+        without adoption those parameters are saved but never updated - the measured symptom was
+        four `thinking_head` tensors with delta_norm exactly 0.0 across consecutive steps.
+        Gradients already exist at the call site, so the adopted tensors take part in this very
+        step; they join after this step's gradient clipping, which is the one compromise.
+
+        Returns:
+            int: The number of parameter tensors added to the optimizer this step.
+        """
+        optimizer = getattr(self, "optimizer", None)
+        model = getattr(self, "model", None)
+        if optimizer is None or model is None:
+            return 0
+        if not hasattr(optimizer, "add_param_group"):
+            _LOG.warning(
+                f"Cannot adopt lazy parameters: {type(optimizer).__name__} exposes no "
+                f"add_param_group; lazy components stay untrained this run."
+            )
+            return 0
+        known = {id(param) for group in optimizer.param_groups for param in group["params"]}
+        fresh = [param for param in model.parameters()
+                 if param.requires_grad and id(param) not in known]
+        if not fresh:
+            return 0
+        optimizer.add_param_group({"params": fresh})
+        return len(fresh)
+
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, Any]:
         start_time = time.time()
         profiler = self._profiler
@@ -2951,6 +2982,12 @@ class PiscesLxTrainingOperator(object):
         self._grad_accum_step = next_accum_step
 
         if did_step:
+            adopted = self._adopt_lazy_parameters()
+            if adopted:
+                _LOG.info(
+                    f"Lazy components entered the optimizer at step {self.global_step}: "
+                    f"{adopted} parameter tensors adopted"
+                )
             self.optimizer_step()
         
         step_time = time.time() - start_time

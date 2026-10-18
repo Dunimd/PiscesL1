@@ -3934,3 +3934,33 @@ A98 的准确表述因此是：**通路已开、区间已进入损失、权重�
 A100（两个 `thinking_head` 并存）需在同一批处理，否则每个头都要一份优化器状态。
 
 本轮净改动：仅这份记录；预设几何对齐与门控日志已在 `b7fbbfa` 提交，工作树干净。
+
+
+### §119 再追加：A103 的优化器增补已生效（条目 515→677、Adam 状态 389→437），但权重仍不动 ⇒ 真断点在**损失合成**（登记 A104）与 **resume 丢状态**（A105）
+
+`_adopt_lazy_parameters()` 实测在 step 0 采纳 **162** 个张量：优化器条目 515 → **677**、
+状态张量 389 → **437**。所以"参数没进优化器"这一条已解决并留下数字。
+
+但连续两次窗口的比对仍是：
+```
+reasoner.cot_reasoner.thinking_head.weight      delta_norm=0.000000
+reasoner.cot_reasoner.thinking_head.bias        delta_norm=0.000000
+reasoner.multi_path_core.thinking_head.weight   delta_norm=0.000000
+reasoner.multi_path_core.thinking_head.bias     delta_norm=0.000000
+```
+进优化器却不更新，唯一自洽解释是**这些参数没有梯度**：reasoner 的损失没有并进训练总损失。
+这与 §48 早已记录的现象同族——`loss = lm_loss + reasoner_loss` 的真实组合点在训练器之外，
+训练器自己从移位 logits 算 `lm_loss`（`opss/train/sft.py:278` 用 `input_ids.clone()` 造 labels），
+模型返回的 reasoner 输出桶**只被报告、从不进入被反向传播的那个标量**。登记 **A104**。
+
+第二条新缺陷：从 `stepA.pt` 续跑后，优化器条目回落到 **515**、状态张量从 **437 归 0**
+（`global_step` 仍为 2 却像重新初始化）——即 **resume 不恢复优化器状态**（或恢复后被重建覆盖）。
+登记 **A105**；它与 A21/A23 时代"续跑配置被忽略"同族，须一并查。
+
+**A98 的当前准确状态**（不夸大）：分词切分 ✓、标记解析 ✓、模型词表几何 ✓、批次含标记 ✓、
+引擎物化 ✓、区间绑定 ✓（`streams bound: ['hypothesis']`）、参数进优化器 ✓；
+**未通的是"区间损失进入被反传的 loss"**（A104），以及 resume 的状态完整性（A105）。
+下一步判据不变：连续窗口比对 `thinking_head.*` 的 `delta_norm > 0`。
+
+本轮净改动：`tools/train/core.py` 的 `_adopt_lazy_parameters` 与其调用点（已按 A103 数字验证，故提交）；
+A104/A105 仅登记取证，未动代码。
