@@ -3842,3 +3842,35 @@ A94 已关（服务侧与拦截器都走 codec）、A101 已关（CRV 解耦、�
 本轮实测过删除面：外部只用到 `eos/pad/cls/think/think_end` 五个，但字段同时被类内的注册表方法引用，
 一次性删干净需要连带改那几个方法并跑分词器回归，剩余窗口不够，故未动、不虚报。
 真实旗舰权重、P1 全部速度/评测指标、M4 三模态语料仍未完成。
+
+
+## §118｜A98 最后一层的定位进展：门控前提被证伪，但去掉前提后仍未触发（三条已排除、两条待查）
+
+**新证伪**：`span_in_batch` 里 `labels is not None` 这一前提在真实训练里恒不成立——
+`PiscesLxToolsDataRawTextDataset` 的条目**只有 `input_ids` 一个键**（实测 `first item keys: ['input_ids']`、
+`labels` 取到空列表），训练器自己从移位 logits 计算 LM 损失、不给模型传 labels。
+⇒ HEAD 里这条前提是把 span 监督挡在训练之外的确定原因之一，且 `opss/train/sft.py:278` 也证明
+labels 是在算子内部由 `input_ids.clone()` 造出来的，模型侧从来收不到。
+
+**去掉该前提后重跑（0.01B / seq256 / 3 步，`TRAIN_EXIT=0`）仍是负结果**：产物
+`materialized=['block_field','crv','long_context','mtp_heads']`、582 张量中 `thinking_head` 键数 0，
+整个 `spans6` 目录里搜不到任何 reasoner 日志行。该改动因此**未提交**（`git checkout` 回退，树干净）。
+
+**已排除（都有实测）**：
+1. 批次里没有标记——排除：同一数据集类直取 40 条，**40/40 的条目同时含 154841/154842**；
+2. 分词器不切分——排除：工件 `special=true` 后 `encode(标记)=[154841]`，且链上 CE 仍 8.9261；
+3. 作用域问题——排除：静态读 2520-2562 行，门控就在常规路径（`if outputs:` 之后的 `x = self.norm(x)` 分支）里，
+   早退分支只在 `x.shape[1] == 0` 时触发。
+
+**待查的两条（下一轮按序做，一次一刀）**：
+- A：`self._marker_tokenizer()` 在训练进程里是否真的返回可用 tokenizer。它是"模型自己构造 `YvTokenizer()`"的兜底，
+  而训练进程的 `PISCESLX_HOME` 指向独立 settings 目录；若解析到不同目录，`get_special_token_id` 会返回 None ⇒
+  标记集合为空 ⇒ 门控恒假且**不打日志**（这正是现象）。一刀验证：真跑里打印
+  `sorted(model._reasoning_marker_ids())` 与 `model._marker_tokenizer()` 的解析路径。
+- B：训练器是否把 batch 的 `input_ids` 在进入模型前改写（`_prepare_model_batch` 会把越界 id `clamp(0, vocab-1)`，
+  见 `tools/train/core.py:2090`——若 vocab 取的是**后端 vocab_size=154820**，那么 154841/154842 会被**夹成 154819**，
+  标记就此消失）。这条嫌疑与"日志里什么都没有"完全吻合，且是**一处静默破坏 span 的现成 bug**。
+  一刀验证：真跑里打印 clamp 前后 `[int(ids.max()), 154841 in ids]`。
+
+若 B 成立，修法是让 clamp 以 `cfg.vocab_size`（模型行数）为准而不是后端词表数——那本身就是分词器与模型
+词表口径不一致的又一处症状，与 §117 的 `special` 标志同源。
