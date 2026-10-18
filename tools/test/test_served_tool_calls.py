@@ -42,6 +42,10 @@ import types
 
 from model.multimodal.tool_call_codec import YvToolCallCodec
 
+#: The answer the stub calculator returns for the expression `2+2`, i.e. the exact value the
+#: served path must carry back to the model. Named because the fixture asserts on it.
+CALCULATOR_TWO_PLUS_TWO = 4.0
+
 
 class PiscesLxServedToolCallTest:
     """Assert the served path executes the JSON dialect and only the JSON dialect."""
@@ -69,10 +73,7 @@ class PiscesLxServedToolCallTest:
 
         class _PiscesLxOutcome:
             success = True
-            # The fixture asks the calculator to evaluate 2+2, so 4.0 is the arithmetic result,
-            # not a tuned value: the test asserts this exact number travels back through the
-            # served path.
-            result = {"expression": "2+2", "value": 4.0}
+            result = {"expression": "2+2", "value": CALCULATOR_TWO_PLUS_TWO}
             error = None
 
         async def execute(name, parameters):
