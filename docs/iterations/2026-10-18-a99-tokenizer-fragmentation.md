@@ -1,0 +1,60 @@
+# A99：分词器把声明的特殊标记碎化，并把"第一个碎片"的 id 当作词元 id 静默存下
+
+日期：2026-10-18（本机 0.1B 档，全部为实测，非读码推断）
+
+## 结论
+
+A98（思考流监督通路断开，见 `docs/audit/00-audit-report.md` §108/§110）的根因**比 §110 记的四点更靠前一层**：
+项目分词器在运行时**不能把声明的特殊标记当作一个词元**，而 `_prepare_special_tokens` 取 id 的方式
+又不校验"是否只有一个词元"，于是把碎片的第一个 id 当词元 id 存下来。两件事叠加，使任何
+"标记条件化"的能力（思考 span、模态标记、工具标记）在**数据面上根本不可表达**。
+
+## 实测证据
+
+1. 工件层：`tokenizer/tokenizer.json` 的 `added_tokens` 共 **36** 条，id 区间 **154820..154855**，
+   正好从后端 `vocab_size = 154820` 起排；模型侧 `cfg.vocab_size = 154885`，即 embedding 已为这些 id 预留行。
+2. 运行时层：把 `tokenizer.json` 里登记的 think 起止标记（竖线加尖括号形式）交给分词器编码，
+   实测得到 `[27, 91, 26779, 91, 29]`（5 个碎片）与 `[27, 91, 14, 26779, 91, 29]`（6 个碎片）。
+   后端 `vocab_size` 仍是 **154820**：这些 added tokens **从未注册进运行时**，只在文件里声明。
+3. 静默错值：`model/tokenizer/tokenizer.py:291-300` 用 `encode(token)[0]` 取 id。
+   实测 `tokenizer_config.json` 的 `extra_special_tokens`（47 条）里有 **26 条**是同样碎化的，
+   于是 `_multimodal_token_ids` 里存的是碎片 id（例如 think 起始标记存成 **27**），且不报错。
+4. 反查失败：`get_special_token_id()` 对 think 起始标记返回 **None**；
+   另测 `YvSpecialTokens` 声明的 answer / reasoning 一族标记，**没有一个**在 `added_tokens` 里，
+   且 `reasoning_start` / `reasoning_end` / `document_token` 等 **17 个字段全仓零消费者**
+   （`document_token` 同时是"document 已不是独立模态"的残留，属禁令 #18 未除根）。
+5. 修复尝试：在 `_prepare_special_tokens` 前插入"按 `tokenizer.json` 的声明补注册 + 校验 id 必须等于
+   文件里的 id + 禁止碎片 id"的实现，跑通失败——该 transformers 版本的
+   `add_tokens` 只接受 `List[str]` 或 `AddedToken`，传字典条目直接
+   `TypeError: Input must be a List[Union[str, AddedToken]]`（栈：`tokenization_utils_tokenizers.py:728`）。
+   改动已 `git checkout` 回退，**树上不留未验证的分词器改动**。
+
+## 本轮已完成的一处对齐（低风险）
+
+`model/tokenizer/special_tokens.py:198-199` 的 think 起止声明由"缺闭合角括号"的形态改为
+`added_tokens` 里**实际注册**的那一对（id 154841 / 154842），并去掉两处 docstring 里重复的默认值字面量。
+注意：这**不解除 A99**——运行时仍会把它们碎化；收益是声明与工件不再是两个分家的事实来源，
+`unified.py:628` 那种"在解码文本里子串匹配结束标记"的判据从此对得上真实串。
+
+## A99 的执行顺序（下一轮按此做）
+
+1. 让 `YvTokenizer` 在加载后把 `tokenizer.json` 的 `added_tokens` **真正注册**进后端：
+   以 `[str]` 形式按 id 升序调用 `add_tokens(..., special_tokens=True)`（不要用字典条目，见证据 5），
+   注册后**逐条断言**"运行时解析到的 id == 文件声明的 id"，不一致即 `RuntimeError`——
+   否则 embedding 行与标记寻址的行会错位。
+2. `_prepare_special_tokens` 改为**只接受单词元解析**（`encode(token)` 长度必须为 1），
+   拿不到就抛错并点名标记；**禁止**再写"碎片首 id"这种静默错值。
+3. 删除 17 个零消费者的标记声明（含 `document_token`，同时清掉禁令 #18 残留）及其 docstring，
+   不保留"以后可能用"的声明。
+4. 机检与阳性对照：`tools/test/` 新增契约测试，断言 (i) 声明为标记的每个串在运行时解析为**一个** id；
+   (ii) 该 id 与 `tokenizer.json` 声明一致；(iii) 故意把某条声明改坏时测试必须失败。
+5. 等价性证明（改分词器必做）：用 `python tools/dev/verify_checkpoint.py`
+   对 `E:/pisceslx-artifacts/ckpt/keep_step375_seq256_a95.pt` 复跑，留出集 CE 必须仍是 **8.9261**
+   （现行语料不含标记串，注册 added tokens 不应改变普通文本的分词）；
+   再加 `python manage.py test --stage 10` 全绿，才谈得上继续 §110 的 (b)-(g)。
+6. 数据侧（M4）随后才能产出可被监督的 thinking span，A98 的判据 `thinking_head.grad is not None` 才有意义。
+
+## 与其他在册缺陷的关系
+
+- A98（思考 span 监督断开）被本条阻塞在最外层；§108/§110 的四点闭合仍然有效，但要在 A99 修好后才可达。
+- A94（服务侧仍按 XML 解析工具调用）与本条无关，仍在册。
