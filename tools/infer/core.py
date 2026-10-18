@@ -766,95 +766,76 @@ class PiscesLxInferenceEngine(object):
         return generated_text
     
     def _process_tool_calls(self, text: str, tool_registry: Any) -> str:
-        """Process agentic calls in generated text using XML syntax.
-        
-        Supports:
-        - <agentic><ag>agent_name</ag></agentic>
-        - <agentic><ag>agent_name</ag><tool><tn>tool_name</tn><tp>params</tp></tool></agentic>
-        - <agentic mode="swarm"><ag_group>...</ag_group></agentic>
+        """Execute the tool calls a generated text asks for and splice the answers back in.
+
+        The model emits standard JSON tool calls inside ordinary text, so this served path parses
+        them with the same codec the protocol layer and the dataset builder use: the documents the
+        training data contains are exactly the documents this executes, and no second dialect
+        exists anywhere in the stack (docs/audit/00 section 109).
+
+        Args:
+            text: Decoded model output.
+            tool_registry: Registry exposing ``execute(name, parameters)``, consulted when the
+                service runs without its own agentic runtime.
+
+        Returns:
+            str: The output with each executed call replaced by its result document; unchanged
+                when the text asked for no tool.
         """
-        import re
-        import json
-        
-        agentic_pattern = r'<agentic[^>]*>.*?</agentic>'
-        matches = re.findall(agentic_pattern, text, re.DOTALL)
-        
-        if not matches:
+        import asyncio
+
+        from model.multimodal.tool_call_codec import YvToolCallCodec, YvToolCallProtocolError
+
+        try:
+            batch = YvToolCallCodec.parse(text)
+        except YvToolCallProtocolError as error:
+            _LOG.warning(f"Generated text carries a malformed tool document; nothing executed: {error}")
             return text
-        
-        for match in matches:
-            try:
-                mode_match = re.search(r'<agentic[^>]*mode="([^"]*)"', match)
-                mode = mode_match.group(1) if mode_match else "single"
-                
-                agent_pattern = r'<ag(?:\s+context="[^"]*")?>(.*?)</ag>'
-                agents = re.findall(agent_pattern, match, re.DOTALL)
-                agents = [a.strip() for a in agents if a.strip()]
-                
-                tool_name = None
-                tool_params = {}
-                
-                tool_match = re.search(r'<tool[^>]*>(.*?)</tool>', match, re.DOTALL)
-                if tool_match:
-                    tool_content = tool_match.group(1)
-                    
-                    tn_match = re.search(r'<tn>(.*?)</tn>', tool_content, re.DOTALL)
-                    if tn_match:
-                        tool_name = tn_match.group(1).strip()
-                    
-                    tp_match = re.search(r'<tp>(.*?)</tp>', tool_content, re.DOTALL)
-                    if tp_match:
-                        try:
-                            tool_params = json.loads(tp_match.group(1).strip())
-                        except json.JSONDecodeError:
-                            tool_params = {"raw": tp_match.group(1).strip()}
-                
-                result_text = None
-                
-                if agents and hasattr(self, '_agentic') and self._agentic is not None:
-                    import asyncio
-                    
-                    agent_name = agents[0]
-                    
-                    if tool_name:
-                        try:
-                            result = asyncio.run(self._agentic.execute_unified_tool(tool_name, tool_params))
-                            if result.success:
-                                result_text = f"<result>{result.result}</result>"
-                            else:
-                                result_text = f"<error>{result.error}</error>"
-                        except Exception as e:
-                            result_text = f"<error>{str(e)}</error>"
-                    else:
-                        try:
-                            result = asyncio.run(self._agentic.execute_unified_tool(agent_name, tool_params))
-                            if result.success:
-                                result_text = f"<result>{result.result}</result>"
-                            else:
-                                result_text = f"<error>{result.error}</error>"
-                        except Exception as e:
-                            result_text = f"<error>{str(e)}</error>"
-                
-                elif tool_name and tool_registry is not None:
-                    import asyncio
-                    try:
-                        result = asyncio.run(tool_registry.execute(tool_name, tool_params))
-                        if result.success:
-                            result_text = f"<result>{result.result}</result>"
-                        else:
-                            result_text = f"<error>{result.error}</error>"
-                    except Exception as e:
-                        result_text = f"<error>{str(e)}</error>"
-                
-                if result_text:
-                    text = text.replace(match, result_text)
-                    
-            except Exception as e:
-                _LOG.warning(f"Failed to process agentic call: {e}")
-                text = text.replace(match, f"<error>Processing failed: {str(e)}</error>")
-        
-        return text
-    
+        if batch.is_empty:
+            return text
+
+        agentic = getattr(self, "_agentic", None)
+        rendered: List[str] = []
+        for group in batch.groups:
+            for call in group.calls:
+                target = call.tool_name or (group.agent_name if group.named else "")
+                coroutine = None
+                if agentic is not None:
+                    coroutine = agentic.execute_unified_tool(target, call.parameters)
+                elif tool_registry is not None:
+                    coroutine = tool_registry.execute(target, call.parameters)
+                else:
+                    rendered.append(YvToolCallCodec.render_result(
+                        target, {"error": "no tool executor is wired into this service"},
+                        agent=group.agent_name))
+                    continue
+                try:
+                    outcome = asyncio.run(coroutine)
+                except (RuntimeError, ValueError, TypeError, OSError) as error:
+                    _LOG.warning(f"Tool {target!r} failed while executing: {error}")
+                    rendered.append(YvToolCallCodec.render_result(
+                        target, {"error": str(error)}, agent=group.agent_name))
+                    continue
+                succeeded = bool(getattr(outcome, "success", True))
+                payload = (getattr(outcome, "result", outcome) if succeeded
+                           else {"error": getattr(outcome, "error", "tool reported no error")})
+                rendered.append(YvToolCallCodec.render_result(
+                    target, payload, agent=group.agent_name))
+
+        if len(batch.consumed_spans) != len(rendered):
+            # Splicing pairwise is only safe when each result belongs to one consumed document.
+            # Otherwise append rather than risk deleting the prose between two documents.
+            _LOG.warning(
+                f"Tool documents ({len(batch.consumed_spans)}) and results ({len(rendered)}) did not"
+                f" line up; results appended instead of spliced."
+            )
+            return text + '\n' + '\n'.join(rendered)
+        updated = text
+        for (start_pos, end_pos), replacement in sorted(
+                zip(batch.consumed_spans, rendered), key=lambda pair: pair[0][0], reverse=True):
+            updated = updated[:start_pos] + replacement + updated[end_pos:]
+        return updated
+
     def batch_generate(self, prompts: List[str], batch_size: Optional[int] = None) -> List[str]:
         """
         Generate text for a batch of prompts with configurable batch size.
