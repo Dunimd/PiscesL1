@@ -2178,8 +2178,12 @@ class YvModel(nn.Module):
         return_task_logits = bool(kwargs.pop("return_task_logits", True))
         return_eval_score = bool(kwargs.pop("return_eval_score", True))
         return_tool_outputs = bool(kwargs.pop("return_tool_outputs", True))
-        return_reasoner_outputs = bool(kwargs.pop("return_reasoner_outputs", True))
-        return_verifier_outputs = bool(kwargs.pop("return_verifier_outputs", return_reasoner_outputs))
+        # One knob, one meaning: this asks only for the reasoning engine's outputs. It defaults to
+        # False because the engine carries a hidden-by-vocab head per stream, and the reasoning
+        # path is entered from the data side when a batch carries markers - see
+        # _batch_has_reasoning_span - rather than from this default (docs/audit/00 section 114).
+        return_reasoner_outputs = bool(kwargs.pop("return_reasoner_outputs", False))
+        return_verifier_outputs = bool(kwargs.pop("return_verifier_outputs", False))
         return_mtp_logits = bool(kwargs.pop("return_mtp_logits", True))
 
         if agent_mode:
@@ -2327,7 +2331,10 @@ class YvModel(nn.Module):
         elif fused_features is not None:
             rca_fused = fused_features
         use_rca_path = rca_fused is not None and getattr(self.cfg, 'use_rca_fusion', True)
-        use_crv_path = return_reasoner_outputs and getattr(self.cfg, 'use_crv_verification', True)
+        # CRV is its own declared capability living in its own module; gating it on the switch
+        # that asks for the reasoning engine's outputs let one knob govern another
+        # (docs/audit/00 section 107), so it follows its own declaration now.
+        use_crv_path = bool(getattr(self.cfg, 'use_crv_verification', True))
 
         if not use_cache or past_key_values is None:
             seq_is_long = self._should_use_long_context_path(x.shape[1])

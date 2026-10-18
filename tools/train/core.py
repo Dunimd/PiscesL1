@@ -2038,7 +2038,6 @@ class PiscesLxTrainingOperator(object):
         model_batch.setdefault("return_task_logits", False)
         model_batch.setdefault("return_eval_score", False)
         model_batch.setdefault("return_tool_outputs", False)
-        model_batch.setdefault("return_reasoner_outputs", False)
         model_batch.setdefault("return_verifier_outputs", False)
         model_batch.setdefault("return_mtp_logits", False)
         model_batch.setdefault("output_attentions", False)

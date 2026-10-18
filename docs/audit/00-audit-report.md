@@ -3769,3 +3769,39 @@ A94 服务侧未动。新基线判读要等这批数据真正跑过窗口：现�
 下一台有内存的机器上第一件事就是复跑它。改动本身的链路中立性论证是：
 `verify_checkpoint` 走 eval（`self.training` 为假）→ 不物化 reasoner，与 §112 之前一致，
 但这是推理，不是证据。
+
+
+## §116｜A101 关闭：CRV 与 reasoner 开关解耦、开关收敛为单一口径；并终于补齐 §114 欠下的等价证据（2026-10-18）
+
+改前三处读码证据：`model/core/model.py:2181` 的 `return_reasoner_outputs` 默认 **True**、训练器
+`tools/train/core.py:2041` 显式传 **False**（同开关两处默认互斥），而 `:2330` 的
+`use_crv_path = return_reasoner_outputs and cfg.use_crv_verification` 把 **CRV 校验能力**挂在这个
+"要不要返回 reasoner 输出"的开关上——正是 §107 定性的一类：声明的旋钮实际由别处 govern。
+若只把默认改 False 而不解耦，推理期的 CRV 会被静默关掉，那是能力回归，不是清理。
+
+**改法**（一次做好，不留兼容层）：
+- `use_crv_path` 只看自己的声明 `cfg.use_crv_verification`（CRV 本来就在独立模块 `:1474` 惰性物化，
+  不需要 reasoner）；
+- `return_reasoner_outputs` 默认改 **False**，语义收敛为"只要 reasoner 的输出"，
+  `return_verifier_outputs` 也不再继承前者（原来 `pop(..., return_reasoner_outputs)` 是第二处连带）；
+- 训练侧不再强行传 False（那行 `setdefault` 删除），训练期进入 reasoner 由 §114 的
+  `_batch_has_reasoning_span` 数据驱动，两个口径不再互相覆盖。
+
+**实测**（`hidden=64` 的 0.01B 真模型，eval）：默认调用下 reasoner **不再被物化**
+（`reasoner built = False`）而 `crv_integration` 仍在（由自身声明 govern，能力未丢）、
+输出键含 `logits/loss/lm_loss/aux_loss`；显式传 `return_reasoner_outputs=True` 时引擎照旧构建。
+闸口：`manage.py test --stage 10 = 20/20`（退出码 0）。
+
+**补上 §114 一直欠的那条证据**：`verify_checkpoint` 对 `keep_step375_seq256_a95.pt` 复跑得
+`VERIFY_EXIT=0`、`shape_mismatch: []`、`parameters_changed 528 / unchanged 26`、
+留出集 CE **8.9261**、`beats_uniform true`、`verdict true`——与 §106 基线逐位相同。
+这条同时覆盖 §114 的"标记驱动物化"与本节 A101 的默认收敛，即两者对既有 0.1B 链与现有分词**等价**；
+§114 里我明确写为"未验、是推理不是证据"的那一项，现在才是证据。
+
+**仍在册（不粉饰）**：`tools/check` errors 4094 / warnings 0，其中我这几批新代码带来的
+`NO-MAGIC-NUMBER`（测试夹具里的括号码点 60/47/62 与 `4.0`、`tool_trace.py:96` 的 `10`）已定位到行、
+尚未清（上次尝试因我把文件写成语法错而回退，须用编辑器逐处改名）；
+`tools/train/core.py:2106-2124` 那段 TypeError 兼容垫片（pop 掉一组 return_* 关键字后重试）
+对本仓模型是死路径，属"不留兼容"该删的对象，但删除会把被它掩盖的真实 TypeError 暴露出来，
+需在能跑长窗口的机器上先验证再删，故本轮不轻动；A100（两个 thinking_head 并存的显存翻倍）
+与 A98 的链上端到端生效仍待更大内存窗口；M4 三模态与真实旗舰权重、P1 指标仍未完成。
