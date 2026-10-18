@@ -3909,3 +3909,28 @@ A98 只能记为"通路已开、监督已进入损失，但权重是否移动未
 
 待办同批补齐：clamp 由静默改为计数告警（它掩盖了本次根因）、新增 stage-10 契约测试
 "每个预设的 vocab_size >= 分词器 id 空间"并带阳性对照（故意调低必失败）。A100/A94/A101 状态不变。
+
+
+### §119 追加：权重是否移动已判定——**没有**。reasoner 不在优化器参数组里（A103 登记）
+
+从 §119 的产物续跑 2 步（`--resume_ckpt`，几何已一致故可续），逐张量比对：
+
+```
+reasoner.cot_reasoner.thinking_head.weight  unchanged=True  delta_norm=0.000000
+reasoner.cot_reasoner.thinking_head.bias    unchanged=True  delta_norm=0.000000
+reasoner.multi_path_core.thinking_head.weight unchanged=True delta_norm=0.000000
+reasoner.multi_path_core.thinking_head.bias   unchanged=True delta_norm=0.000000
+本轮变化张量总数 = 15（lm_head 亦未变）
+```
+
+结论链：A102 修好后**标记终于进到模型**（reasoner 物化、`streams bound`、`thinking_head` 进保存状态），
+但**监督不更新权重**——优化器条目 515/状态张量 389 自始至终未变，reasoner 是在优化器建立之后
+才惰性物化的，参数没进任何 param_group。这是 §21/§48 老账（`ensure_all_modules` 全仓无人调用、
+只物化 `TRAINING_COMPONENTS`）在新路径上的确切复现，且现在有了可核对的数字。登记 **A103**。
+
+A98 的准确表述因此是：**通路已开、区间已进入损失、权重更新尚未接通**。
+下一步（A103 修法，判据明确）：让优化器在惰性组件物化后**增补参数组**（或在建模后立即物化 reasoner
+再建优化器），判据即本段的比对反转——`thinking_head.*` 的 `delta_norm > 0` 且优化器条目数增加；
+A100（两个 `thinking_head` 并存）需在同一批处理，否则每个头都要一份优化器状态。
+
+本轮净改动：仅这份记录；预设几何对齐与门控日志已在 `b7fbbfa` 提交，工作树干净。
