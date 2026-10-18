@@ -3713,3 +3713,41 @@ A94（服务侧仍按 XML）与 A98 均在册未修；回退后 stage-10 复跑�
 `hypothesis` 一条可监督（§112 剩余项 1），`cot_reasoner.thinking_head` 的重复头仍未合并（剩余项 2）；
 A94 服务侧未动。新基线判读要等这批数据真正跑过窗口：现有 CE 8.9261 是**无 span 语料**的基线，
 带 span 的训练曲线不能与它直接比（数据分布变了），下一步按 §101 的三点均值口径重开一条链。
+
+
+## §114｜真窗口打脸：0.1B 训练在起点段错误，span 监督在链上仍然没跑到；同时查出"默认值互斥"的一处口径错（2026-10-18）
+
+§112/§113 之后跑了一条真窗口（`--model_size 0.1B --seq_len 256 --max_steps 6 --resume_ckpt keep_step375_seq256_a95.pt --dataset data/corpus_tools/gsm8k_tool_trace_span.jsonl`，日志 `E:/pisceslx-artifacts/spans1/win.log`）。结果**必须如实记账**：
+
+1. `TRAIN_EXIT=139`——进程在 `tools/train/orchestrator.py:1887 start_training` 处段错误退出，
+   未产出可用检查点（`final_model.pt` 的 step=381 属残缺产物，不能当训练结果引用）。
+2. 对照取证（`span_diff.py`）：起点与产物两侧 `materialized_components` 都只有
+   `['block_field','long_context','mtp_heads']`，`model_state_dict` 里 **`thinking_head` 键数量 = 0**，
+   优化器条目 515 / 状态张量 421 两侧完全一致。**结论：§112 打通的通路在这条 0.1B 链上从未被走到**，
+   我之前"梯度实测非 None"的证据全部来自 0.01B 直接探针与引擎级调用，不能外推到真训练。
+3. 查到一个我上一轮**改错方向**的地方：`model/core/model.py:2181` 的
+   `return_reasoner_outputs = bool(kwargs.pop("return_reasoner_outputs", True))` 默认是 **True**，
+   而训练器 `tools/train/core.py:2041` 显式传 **False**——同一个开关两处默认互斥。
+   §112 我把物化条件放宽成"训练且带 labels"，等于要求每次监督步都造出两个
+   `hidden x vocab` 的思考头（0.1B 档 1024x154885 约 **1.58 亿参数/个**，再算梯度与 Adam 状态），
+   在本机 4.6GB 硬闸下这是真实的资源回归；探针随后直接
+   `DefaultCPUAllocator: not enough memory` 也印证了主机内存已被打空。
+
+**工作树里有一处未验证的收窄改动（未提交，按"未验证不进提交"）**：
+`model/core/model.py` 改为**由批次是否含已注册标记**决定是否物化 reasoner
+（`_batch_has_reasoning_span` + `_reasoning_marker_ids`，标记 id 复用
+`YvMultiPathReasoningEngine._STREAM_MARKERS` 与 `YvTokenizer.get_special_token_id`，不新增旗标、
+不把开关再复制一份）。已实测的只有一件事：`_reasoning_marker_ids()` 在该模型上解出
+`[154841, 154842]`。**其余未验**：标记驱动的物化在训练器传 `False` 时是否生效、
+0.01B 端到端梯度、stage-10 与 `verify_checkpoint` 等价性——主机内存不足，跑不了，
+下一轮第一件事是先腾出内存跑这三项，通过才提交，不通过就 `git checkout` 回退。
+
+**因此下面两条继续在册**：
+
+- **A100（新登记）**：思考头是 `hidden x vocab` 的巨型投影，两个头并存（`cot_reasoner` 与
+  `multi_path_core`）使 span 监督的显存代价翻倍。要么合并为一个头（§108 第 4 点已判定属功能重叠），
+  要么让 `vocab` 投影走低秩/分块方案；在解决之前，0.1B 档的 span 训练在本机不可行，
+  须在有更大显存的窗口里验。这不是把问题推给硬件：判据（`thinking_head.grad` 非 None 且
+  保存状态里出现该键）本身要求一次真实训练步，而真训练步在 4.6GB 闸门下必然先于监督崩。
+- **A101（新登记）**：`return_reasoner_outputs` 两处默认互斥（模型侧 True / 训练器 False），
+  属 §107 同族的"声明与到值断链"，应收敛为单一口径（建议默认 False，由数据/调用方显式开启）。
