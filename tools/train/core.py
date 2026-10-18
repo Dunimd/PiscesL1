@@ -2090,6 +2090,19 @@ class PiscesLxTrainingOperator(object):
                 model_batch["input_ids"] = input_ids.clamp(0, _cached_vocab - 1)
 
             labels = model_batch.get("labels")
+            if labels is None:
+                # The model composes the reasoning stream loss only on the branch that
+                # receives labels (`loss = lm_loss + reasoner_loss` in model/core/model.py),
+                # and dataset items carry input_ids only, so span supervision was
+                # unreachable in real training even though the same batch yields a
+                # 0.049826-norm gradient when labels are present (docs/audit/00 §120, A104).
+                # The derived target matches the operator's own convention: next token, pad
+                # ignored.
+                source = model_batch.get("input_ids")
+                if isinstance(source, torch.Tensor):
+                    derived = source.clone()
+                    derived[derived == self._pad_token_id()] = -100
+                    model_batch["labels"] = derived
             if isinstance(labels, torch.Tensor):
                 if bool((labels >= _cached_vocab).any().item()):
                     labels = labels.clone()
@@ -2896,6 +2909,16 @@ class PiscesLxTrainingOperator(object):
                 torch.cuda.empty_cache()
         except Exception:
             pass
+
+    def _pad_token_id(self) -> int:
+        """Padding id used when deriving self-supervised targets for the model.
+
+        Returns:
+            int: The tokenizer's padding id, or 0 when no tokenizer is bound.
+        """
+        tokenizer = getattr(self, "tokenizer", None)
+        pad = getattr(tokenizer, "pad_token_id", None) if tokenizer is not None else None
+        return int(pad) if isinstance(pad, int) else 0
 
     def _adopt_lazy_parameters(self) -> int:
         """Give parameters created after the optimizer was built an optimizer group.
