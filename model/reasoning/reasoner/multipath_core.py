@@ -125,7 +125,21 @@ ABSTRACTION_COMPRESSION_WEIGHT = 0.3
 
 
 # Paper: Wang et al., "Self-Consistency Improves Chain of Thought Reasoning in Language Models", ICLR 2023
+from utils.dc import PiscesLxLogger
+from utils.paths import PiscesLxPaths
+_LOG = PiscesLxLogger("Yv.Reasoner", file_path=PiscesLxPaths.get_log_file("Yv.Reasoner"), enable_file=True)
+
 class YvMultiPathReasoningEngine(nn.Module):
+    #: Stream -> (start marker attribute, end marker attribute) on YvSpecialTokens.
+    #: Only streams whose marker pair is registered in the vocabulary artefact may appear here.
+    #: `evidence` and `conclusion` would need a second and third registered pair; mapping them to
+    #: unregistered strings is the "declared but unrecognised" state the tokenizer contract forbids
+    #: (docs/iterations/2026-10-18-a99-tokenizer-fragmentation.md), and their projections stay
+    #: untrained until the vocabulary grows - which is a geometry decision, not a silent fallback.
+    _STREAM_MARKERS = {
+        'hypothesis': ('think_token', 'think_end_token'),
+    }
+
     """Execute multi-path chain-of-thought reasoning with adaptive abstraction.
     
     This class implements a sophisticated multi-path reasoning engine that
@@ -183,7 +197,7 @@ class YvMultiPathReasoningEngine(nn.Module):
         uncertainty_head (nn.Sequential): Uncertainty estimation network.
         reasoning_streams (nn.ModuleDict): Multi-stream reasoning heads.
         thinking_head (nn.Linear): Final output head.
-        reasoning_tokens (dict): Special token identifiers.
+        reasoning_intervals (dict): stream name -> (start id, end id) marker interval.
     
     Example:
         >>> engine = YvMultiPathReasoningEngine(config)
@@ -308,42 +322,75 @@ class YvMultiPathReasoningEngine(nn.Module):
         # Final thinking head for collapsed reasoning output.
         self.thinking_head = nn.Linear(self.hidden_size, self.vocab_size)
 
-        # Token identifiers demarcating reasoning segments; populated lazily.
-        self.reasoning_tokens = {
-            'start_hypothesis': None,
-            'start_evidence': None,
-            'start_conclusion': None,
-            'hypothesis_split': None,
-            'hypothesis_merge': None
-        }
+        #: A supervised reasoning stream is a **closed marker interval** (start id, end id).
+        #: Streams whose marker pair is not registered in the vocabulary stay None and are
+        #: skipped instead of being filled with vocabulary-tail integers.
+        self.reasoning_intervals = {name: None for name in self._STREAM_MARKERS}
+        self._marker_tokenizer = None
 
     def initialize_reasoning_tokens(self, tokenizer):
-        """Populate reasoning token identifiers using an external tokenizer.
+        """Bind each reasoning stream's marker pair through the tokenizer's registered table.
+
+        Marker strings come from :class:`YvSpecialTokens`, the single declaration the vocabulary
+        is built from, and their ids come from ``get_special_token_id``, which resolves against
+        the backend's own added-token table. A marker the artefact does not register stays
+        unmapped and its stream unsupervised: inventing an id from the tail of the vocabulary is
+        what made every span invisible while looking like a working configuration
+        (docs/audit/00 section 108).
 
         Args:
-            tokenizer: Tokenizer exposing ``convert_tokens_to_ids``. If ``None``
-                or misconfigured, fallback defaults are applied.
-        """
-        if tokenizer is not None:
-            self.reasoning_tokens = {
-                'start_hypothesis': tokenizer.convert_tokens_to_ids('<|start_hypothesis|>'),
-                'start_evidence': tokenizer.convert_tokens_to_ids('<|start_evidence|>'),
-                'start_conclusion': tokenizer.convert_tokens_to_ids('<|start_conclusion|>'),
-                'hypothesis_split': tokenizer.convert_tokens_to_ids('<|hypothesis_split|>'),
-                'hypothesis_merge': tokenizer.convert_tokens_to_ids('<|hypothesis_merge|>')
-            }
-        else:
-            self._set_default_reasoning_tokens()
+            tokenizer: The project tokenizer, or None when none is bound yet.
 
-    def _set_default_reasoning_tokens(self):
-        """Assign deterministic reasoning tokens using tail indices of the vocabulary."""
-        self.reasoning_tokens = {
-            'start_hypothesis': self.vocab_size - 5,
-            'start_evidence': self.vocab_size - 4,
-            'start_conclusion': self.vocab_size - 3,
-            'hypothesis_split': self.vocab_size - 2,
-            'hypothesis_merge': self.vocab_size - 1
-        }
+        Returns:
+            None
+        """
+        self._marker_tokenizer = tokenizer
+        self.reasoning_intervals = {name: None for name in self._STREAM_MARKERS}
+        if tokenizer is None or not hasattr(tokenizer, 'get_special_token_id'):
+            _LOG.warning("Reasoner: no tokenizer bound; reasoning streams are unsupervised.")
+            return
+
+        from ...tokenizer.special_tokens import YvSpecialTokens
+        declared = YvSpecialTokens()
+        unbound = []
+        for name, (start_attr, end_attr) in self._STREAM_MARKERS.items():
+            start_marker = getattr(declared, start_attr)
+            end_marker = getattr(declared, end_attr)
+            start_id = tokenizer.get_special_token_id(start_marker)
+            end_id = tokenizer.get_special_token_id(end_marker)
+            if start_id is None or end_id is None:
+                unbound.append(name + '(' + start_marker + ' / ' + end_marker + ')')
+                continue
+            self.reasoning_intervals[name] = (int(start_id), int(end_id))
+
+        bound = [name for name, pair in self.reasoning_intervals.items() if pair is not None]
+        _LOG.info("Reasoner: streams bound to marker intervals: " + str(bound))
+        if unbound:
+            _LOG.warning(
+                "Reasoning streams left unsupervised because their markers are not registered "
+                "in the vocabulary artefact: " + str(unbound)
+            )
+
+    def has_reasoning_span(self, input_ids):
+        """Report whether ``input_ids`` contains any bound reasoning marker.
+
+        Training uses this to decide whether to run the reasoning engine at all: supervision is
+        driven by a span actually being present in the batch, not by a switch a caller has to
+        remember to raise.
+
+        Args:
+            input_ids: Token id tensor of shape [batch, seq], or None.
+
+        Returns:
+            bool: True when at least one bound marker id occurs in the batch.
+        """
+        if input_ids is None or not torch.is_tensor(input_ids) or input_ids.numel() == 0:
+            return False
+        marker_ids = {int(v) for pair in self.reasoning_intervals.values() if pair for v in pair}
+        if not marker_ids:
+            return False
+        markers = torch.tensor(sorted(marker_ids), device=input_ids.device, dtype=input_ids.dtype)
+        return bool(torch.isin(input_ids, markers).any())
 
     def resize_vocab(self, new_vocab_size):
         """Resize vocabulary-dependent heads while preserving existing weights.
@@ -546,7 +593,9 @@ class YvMultiPathReasoningEngine(nn.Module):
             dict: A dictionary containing thinking logits, loss, uncertainty scores, fact consistency,
                   reasoning outputs, and reflection logits.
         """
-        if any(v is None for v in self.reasoning_tokens.values()):
+        if self._marker_tokenizer is None:
+            # Markers resolve against the vocabulary; with no tokenizer bound there is nothing
+            # to resolve, so no stream can be supervised.
             self.initialize_reasoning_tokens(None)
 
         device = hidden_states.device
@@ -716,27 +765,40 @@ class YvMultiPathReasoningEngine(nn.Module):
         return combined_output
 
     def _create_reasoning_masks(self, input_ids):
-        """
-        Create reasoning masks based on input token IDs and reasoning tokens.
+        """Build per-stream supervision masks from closed marker intervals.
+
+        A stream is supervised strictly between its start marker and its end marker; the end
+        marker's own position is excluded because the target there is the token leaving the span,
+        and an unclosed start marker supervises nothing at all.
+        The previous semantics - the next stream's start ends this stream - cannot be bound to
+        the markers this vocabulary registers: with only one pair available the hypothesis mask
+        stayed true all the way to end-of-sequence, which would have supervised ordinary text as
+        reasoning (docs/iterations/2026-10-18-a99-tokenizer-fragmentation.md).
 
         Args:
             input_ids (torch.Tensor): Input token IDs of shape [batch_size, seq_len].
 
         Returns:
-            dict: Dictionary containing reasoning masks for hypothesis, evidence, and conclusion.
+            dict: stream name -> bool mask; only streams with a bound marker pair and at least
+                one live position appear.
         """
         if input_ids is None:
             return {}
         masks = {}
-        start_hyp = (input_ids == self.reasoning_tokens['start_hypothesis']).cumsum(dim=1) > 0
-        end_hyp = (input_ids == self.reasoning_tokens['start_evidence']).cumsum(dim=1) > 0
-        masks['hypothesis'] = start_hyp & ~end_hyp
-        start_ev = (input_ids == self.reasoning_tokens['start_evidence']).cumsum(dim=1) > 0
-        end_ev = (input_ids == self.reasoning_tokens['start_conclusion']).cumsum(dim=1) > 0
-        masks['evidence'] = start_ev & ~end_ev
-        start_con = (input_ids == self.reasoning_tokens['start_conclusion']).cumsum(dim=1) > 0
-        end_con = (input_ids == self.reasoning_tokens['hypothesis_merge']).cumsum(dim=1) > 0
-        masks['conclusion'] = start_con & ~end_con
+        for name, pair in self.reasoning_intervals.items():
+            if pair is None:
+                continue
+            start_id, end_id = pair
+            inside = (input_ids == start_id).cumsum(dim=1) > (input_ids == end_id).cumsum(dim=1)
+            # A stream only counts when its interval actually closes: a start marker left
+            # unclosed would otherwise mark every remaining position as reasoning, which is the
+            # exact failure this redesign is meant to make impossible.
+            closes_ahead = torch.flip(
+                torch.cumsum(torch.flip((input_ids == end_id), dims=[1]), dim=1), dims=[1]
+            ) > 0
+            mask = inside & closes_ahead
+            if bool(mask.any()):
+                masks[name] = mask
         return masks
 
     def _calculate_problem_complexity(self, hidden_states):

@@ -949,6 +949,9 @@ class YvModel(nn.Module):
         #: injected into every gate; a per-gate cache cannot express it (docs/audit/00 §102).
         #: Gates are matched by capability (`_stage_context`), not by class, because the stack
         #: uses more than one gate type.
+        #: Marker resolution lives here; bound by the trainer or built lazily.
+        self.tokenizer = None
+
         from ..moe.gate import YvPathMoeStageContext
         self.path_moe_context = YvPathMoeStageContext()
         _path_moe_gates = [module for module in self.modules()
@@ -1324,8 +1327,38 @@ class YvModel(nn.Module):
             from ..reasoning import YvUnifiedReasoner
             _LOG.debug("YvModel: lazy-init reasoner...")
             self.reasoner = YvUnifiedReasoner(self.cfg, device=self._device, dtype=self._dtype)
-            self.reasoner.initialize_reasoning_tokens(None)
+            self.reasoner.initialize_reasoning_tokens(self._marker_tokenizer())
             self._lazy_initialized['reasoner'] = True
+
+    def bind_tokenizer(self, tokenizer) -> None:
+        """Attach the project tokenizer so marker-conditioned training can resolve markers.
+
+        The reasoning streams are demarcated by special tokens, and the ids live in the
+        vocabulary artefacts, not in the model. Before this existed `YvModel` had no tokenizer
+        at all, so the reasoner could only ever fall back to invented ids and every thinking
+        span stayed unsupervised (docs/audit/00 section 108).
+
+        Args:
+            tokenizer: The project tokenizer exposing ``get_special_token_id``.
+
+        Returns:
+            None
+        """
+        self.tokenizer = tokenizer
+        if self.reasoner is not None:
+            self.reasoner.initialize_reasoning_tokens(tokenizer)
+
+    def _marker_tokenizer(self):
+        """Return the bound tokenizer, constructing the project one once if none was bound.
+
+        Returns:
+            The tokenizer whose special-token table defines the reasoning markers.
+        """
+        if self.tokenizer is not None:
+            return self.tokenizer
+        from ..tokenizer.tokenizer import YvTokenizer
+        self.tokenizer = YvTokenizer()
+        return self.tokenizer
 
     def _lazy_get_agentic(self) -> None:
         if self.agentic is None:
@@ -1626,7 +1659,7 @@ class YvModel(nn.Module):
             self.reasoner.resize_vocab(new_num_tokens)
         self.cfg.vocab_size = new_num_tokens
 
-        self.reasoner.initialize_reasoning_tokens(None)
+        self.reasoner.initialize_reasoning_tokens(self._marker_tokenizer())
         _LOG.info(
             f"Resized token embeddings to {new_num_tokens}. "
             f"Remember to update special token IDs in the reasoner."
@@ -2465,19 +2498,28 @@ class YvModel(nn.Module):
             x = self.norm(x)
             logits = self.lm_head(x)
 
-            # Lazy-init reasoner and downstream modules
-            if return_reasoner_outputs:
+            # Lazy-init reasoner and downstream modules.
+            # Materialising the engine during supervised training is what lets a batch that
+            # carries markers be supervised at all; the forward itself still only runs when a
+            # bound marker is present, so plain pretraining text pays no extra compute.
+            if return_reasoner_outputs or (self.training and labels is not None):
                 self._lazy_get_reasoner()
             if return_verifier_outputs:
                 self._lazy_get_vericot()
             if return_tool_outputs:
                 self._lazy_get_seer()
 
+            reasoner_input_ids = (
+                input_ids[:, :x.shape[1]]
+                if input_ids is not None and input_ids.shape[1] > x.shape[1]
+                else input_ids
+            )
+            #: The thinking stream is supervised when the batch actually carries a bound marker,
+            #: not when a caller remembers to raise a switch.
             reasoner_out = None
-            if return_reasoner_outputs and self.reasoner is not None:
-                reasoner_input_ids = (
-                    input_ids[:, :x.shape[1]] if input_ids.shape[1] > x.shape[1] else input_ids
-                )
+            if self.reasoner is not None and (return_reasoner_outputs or (
+                    self.training and labels is not None
+                    and self.reasoner.multi_path_core.has_reasoning_span(reasoner_input_ids))):
                 reasoner_labels = (
                     labels[:, :x.shape[1]]
                     if labels is not None and labels.shape[1] > x.shape[1]

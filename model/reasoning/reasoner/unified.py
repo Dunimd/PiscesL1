@@ -421,13 +421,22 @@ class YvUnifiedReasoner(nn.Module):
             labels = memory_context
             memory_context = None
 
-        # Interpret integer-valued attention_mask as token IDs when appropriate.
-        input_ids_tokens = None
-        if torch.is_tensor(attention_mask) and attention_mask.dtype in (torch.long, torch.int32, torch.int64):
-            input_ids_tokens = attention_mask
+        # Span boundaries are marker token ids, so the engine must see the batch's real token
+        # ids. Reading them off attention_mask - a 0/1 tensor - made every span test fail by
+        # construction (docs/audit/00 section 108).
+        input_ids_tokens = input_ids if torch.is_tensor(input_ids) else None
 
         # Use the CoT path when routing thresholds are not satisfied.
-        if not self._should_use_multi_path(hidden_states):
+        # Only the multi-path engine carries stream supervision, so a batch that actually holds
+        # a closed thinking span must route there: the CoT branch has no loss term for its
+        # thinking head, so routing it there would silently drop the supervision
+        # (docs/audit/00 section 108 point 4).
+        span_supervised = (
+            labels is not None
+            and input_ids_tokens is not None
+            and self.multi_path_core.has_reasoning_span(input_ids_tokens)
+        )
+        if not (self._should_use_multi_path(hidden_states) or span_supervised):
             cot_out = self.cot_reasoner.forward(
                 input_ids=hidden_states,
                 attention_mask=attention_mask,

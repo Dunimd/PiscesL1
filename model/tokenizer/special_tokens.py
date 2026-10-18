@@ -154,8 +154,9 @@ class YvSpecialTokens:
         audio_token (str): Audio modality marker. Default: "<audio>".
         video_token (str): Video modality marker. Default: "<video>".
         document_token (str): Document modality marker. Default: "<document>".
-        think_token (str): Thinking block start marker. Default: "<think".
-        think_end_token (str): Thinking block end marker. Default: "</think".
+        think_token (str): Thinking block start marker; must equal the string registered
+            in the vocabulary artefact (asserted by the tokenizer contract test).
+        think_end_token (str): Thinking block end marker; same requirement.
         answer_token (str): Answer block start marker. Default: "<answer>".
         answer_end_token (str): Answer block end marker. Default: "</answer>".
         verify_token (str): Verification block start marker. Default: "<verify>".
@@ -195,8 +196,8 @@ class YvSpecialTokens:
     video_token: str = "<video>"
     document_token: str = "<document>"
 
-    think_token: str = "<think"
-    think_end_token: str = "</think"
+    think_token: str = '<think>'
+    think_end_token: str = '</think>'
     answer_token: str = "<answer>"
     answer_end_token: str = "</answer>"
     verify_token: str = "<verify>"

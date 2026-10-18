@@ -3636,3 +3636,56 @@ span 时前向），端到端探针把其中两处拦下，已全部 `git checko
 **记账**：`thinking_head` 那 44% 参数继续无梯度；§108 的判定按本节三条事实更新；
 A94（服务侧仍按 XML）与 A98 均在册未修；回退后 stage-10 复跑结果见提交信息。
 
+
+
+## §112｜A98/A99 落地：思考流 span 监督从"结构上不可能"变为可训练，成对区间语义 + 后端权威解析 + 机检（2026-10-18）
+
+按 §110/§111 的口径一次做完，改六个文件、加一道机检，全部实测：
+
+**做了什么**
+
+- `model/tokenizer/special_tokens.py`：think 起止标记声明改为**工件实际注册的串**
+  （`<'+'think'+'>` 形式，id 154841/154842）。注意 §110 时我把它猜成带竖线的形式并据此"对齐"过一次，
+  **那次是错的**；本轮用码点逐条比对才纠正（工件注册的是无竖线的形态）。
+- `model/reasoning/reasoner/multipath_core.py`：
+  (1) `reasoning_tokens`（5 个"下一流起点即本流终点"的整数）整体换成
+      `reasoning_intervals`（**成对闭区间**），流的标记对来自 `_STREAM_MARKERS` 一张表；
+  (2) 区间语义为"严格在起止标记之间"，且**未闭合的起始标记不监督任何位置**
+      （用反向累积和判定后方确有闭合），这正是 §110 预判的失败模式；
+  (3) 解析一律走 `tokenizer.get_special_token_id`，解析不到就**保持未绑定并 WARNING 点名**，
+      绝不再用词表尾部整数冒充标记（`_set_default_reasoning_tokens` 这条路整体删除）；
+  (4) 新增 `has_reasoning_span(input_ids)`；(5) 该模块此前没有日志句柄，按 §111 第 3 条
+      以库内既有写法补 `_LOG`（"Yv.Reasoner"）。
+  (6) `_STREAM_MARKERS` 只保留 **hypothesis** 一条：evidence/conclusion 需要的第二、三对标记
+      工件里不存在，映射它们就是 A99 文档禁止的"声明了但后端不认识"中间态。
+- `model/reasoning/reasoner/unified.py`：不再把 0/1 注意力掩码当 token id 传给引擎；
+  并补上**路由**这一处闭合——只有多路引擎带流内监督，批次含闭合 span 时必须走它，
+  因为 CoT 分支的 thinking_head 没有损失项（§108 第 4 点），否则监督被静默丢弃。
+- `model/core/model.py`：新增 `bind_tokenizer()` 与 `_marker_tokenizer()`（此前 `YvModel` **根本没有**
+  tokenizer 属性，这就是 §110 第 1 条实测的后果）；reasoner 的惰性物化改为"训练且带 labels"，
+  前向则由"批次是否含已绑定标记"驱动，不新增旗标。
+- `tools/test/test_reasoning_span_supervision.py`（新，进 stage-10）：8 项检查，含
+  "声明串必须等于工件注册串"、阳性对照"改坏的标记被拒而不是映射到碎片 id"、
+  区间恰好覆盖标记之间、未闭合不监督、无标记不触发。
+
+**实测证据**
+
+- 引擎层：绑定 `hypothesis=(154841,154842)`；带 span 批次 `thinking_head.weight.grad` 范数 **0.064**；
+  span loss 14.3902 vs 无标记 11.9938（流内项确实在目标里）。
+- 模型层：`YvModel` 训练态下 reasoner 物化、`has_reasoning_span=True`、
+  `reasoner.multi_path_core.thinking_head` 权重梯度范数 **0.092176**、偏置 0.396418，
+  loss 18.26 → 32.66；同模型跑**不含标记**的批次时检测为 False、loss 18.3756 —— 现行语料零扰动。
+- 闸口：`manage.py test --stage 10` **19/19**（新套件在内）；`tools/check` **4085 → 4088**、warnings 0
+  （新套件初稿带来 48 处裸数字，已全部改为具名夹具，净增 +3 来自新增具名常量与代码行）；
+  `verify_checkpoint` 对 `keep_step375_seq256_a95.pt`：`shape_mismatch: []`、
+  `parameters_changed 528`、留出集 CE **8.9261**（与 §106 逐位相同）、`verdict true` —— 证明这批模型改动
+  对既有链与既有分词是等价的，不是靠改动讲故事。
+
+**如实记下的剩余项**
+
+1. evidence / conclusion 两流的投影层因词表没有第二、三对标记而**继续不可训练**；
+   扩词表会改 `cfg.vocab_size` 与 embedding 行几何、使既有检查点需要 resize 或作废，属重开基线的决定。
+2. `reasoner.cot_reasoner.thinking_head` 仍无梯度——它与多路引擎的头是 §108 第 4 点指出的**功能重叠**，
+   应当合并为一处，而不是让第二个头永远不训练。
+3. 数据侧还没有产出带闭合 span 的文档（M4）；通路已开，语料未跟上。
+4. A94（服务侧仍按 XML 解析工具调用）未动。
