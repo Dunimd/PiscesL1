@@ -441,6 +441,7 @@ class YvUnifiedReasoner(nn.Module):
                 input_ids=hidden_states,
                 attention_mask=attention_mask,
                 memory_context=memory_context,
+                thinking_head=self.multi_path_core.thinking_head,
                 **kwargs
             )
             # Ensure the CoT output dictionary exposes a "loss" entry.

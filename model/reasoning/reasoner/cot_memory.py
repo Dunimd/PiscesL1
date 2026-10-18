@@ -111,7 +111,7 @@ class YvCoTMemoryReasoner(nn.Module):
            - Residual connections throughout
         
         3. Output Heads:
-           - thinking_head: [B, H] -> [B, V] for token prediction
+           - (no own thinking head; the unified reasoner injects the shared one)
            - difficulty_head: [B, H] -> [B, 5] for difficulty levels
            - reflection_head: [B, H] -> [B, 4] for reflection types
            - confidence_head: [B, H] -> [B, 1] for confidence score
@@ -136,7 +136,7 @@ class YvCoTMemoryReasoner(nn.Module):
         vocab_size (int): Vocabulary size for output predictions.
         reasoning_layers (nn.ModuleList): Stack of transformer encoder layers.
         depth_controller (nn.Sequential): Network for depth prediction.
-        thinking_head (nn.Linear): Token prediction head.
+        thinking_head: not owned here - supplied by ``YvUnifiedReasoner`` per call.
         difficulty_head (nn.Linear): Difficulty classification head.
         reflection_head (nn.Linear): YvReActReflection type head.
         confidence_head (nn.Linear): Confidence estimation head.
@@ -204,7 +204,11 @@ class YvCoTMemoryReasoner(nn.Module):
         )
 
         # Initialize output heads for different prediction tasks.
-        self.thinking_head = nn.Linear(cfg.hidden_size, cfg.vocab_size)
+        #: No thinking projection here: `YvUnifiedReasoner` injects the single shared
+        #: hidden-by-vocab head owned by the multi-path engine. Owning a second one meant
+        #: 310,722,654 parameters (hidden 2048 x vocab) per model, half of which could never
+        #: receive a gradient because this branch contributes no loss term
+        #: (docs/audit/00 section 108, defect A100).
         self.difficulty_head = nn.Linear(cfg.hidden_size, 5)
         self.reflection_head = nn.Linear(cfg.hidden_size, 4)
         self.confidence_head = nn.Linear(cfg.hidden_size, 1)
@@ -429,7 +433,14 @@ class YvCoTMemoryReasoner(nn.Module):
                     break
         
         final_state = reasoning_states[:, -1, :]
-        thinking_logits = self.thinking_head(final_state)
+        thinking_head = kwargs.get("thinking_head")
+        if thinking_head is None:
+            raise ValueError(
+                "YvCoTMemoryReasoner.forward requires the shared thinking head via the "
+                "'thinking_head' keyword; the unified reasoner owns exactly one hidden-by-vocab "
+                "projection so the two branches cannot carry duplicate copies (A100)."
+            )
+        thinking_logits = thinking_head(final_state)
         difficulty_logits = self.difficulty_head(final_state)
         reflection_logits = self.reflection_head(final_state)
         confidence_score = torch.sigmoid(self.confidence_head(final_state))

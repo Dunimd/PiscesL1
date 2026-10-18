@@ -4009,3 +4009,30 @@ A104 那条改动（缺 labels 时派生自监督目标）实测后 `thinking_he
 本轮净改动仅此记录：工作树干净、`E:/pisceslx-artifacts` 2.5GB、旧几何产物已退役到
 `retired-151646-geometry/`。A98 未申报完成：通路七段（切分/解析/几何/入批/物化/区间/进优化器）
 均已实测打通，最后一段"区间损失对梯度有非零贡献"仍未证。
+
+
+## §120｜A100 除根：合并重复的思考投影，实测消除 310,722,654 参数；并首次拿到 `thinking_head` 的真实梯度
+
+**规模先量化**：默认 `YvConfig`（hidden 2048 × vocab 151646）下，**单个** `cot_reasoner.thinking_head`
+实测 **310,722,654 参数 ≈ 1.24 GB fp32**；这样的头有两个，第二个（CoT 支）按 §108 的记录**永远没有损失项**。
+这解释了此前一连串现象：物化即段错误、§48 的"44% 参数无梯度"、以及 A104 的探针根本跑不起来。
+
+**合并做法（单一所有者 + 注入使用，不留第二份也不造 state_dict 重复键）**：
+`cot_memory.py` 删除自建的 `self.thinking_head`，`forward` 改为经 `thinking_head` 关键字接收共享投影，
+缺参数时抛 `ValueError` 点名要求注入（不做静默兜底成零张量，那是 §119 clamp 同族病）；
+`unified.py` 的唯一 CoT 调用点传入 `self.multi_path_core.thinking_head`。投影归多路引擎所有——它就是损失
+归属地（`_compute_reasoning_loss` 的 stream CE 用它的输出）。
+
+**实测（改后）**：`named_parameters` 里只剩 `multi_path_core.thinking_head.weight (151646, 2048)` 与 `.bias`，
+reasoner 总参数 **761,897,597**（消除 310,722,654）；`manage.py test --stage 10 = 20/20`（退出码 0）；
+`python -m tools.check` **4093 errors / 0 warnings**（与合并前持平）。
+
+**A104 随之破局——模型级首次拿到真实梯度**：合并后重跑之前必然段错误的那次探针，这次跑通：
+批次含标记 `True`、`reasoner_out is None: False`、**`reasoner_out['loss'] = 14.431`**、
+总损失 **32.833**、**`thinking_head.weight.grad` 范数 0.049826**。
+⇒ "区间损失不产生非零梯度"这一怀疑被否证；剩下的唯一缺口是**训练器根本不传 labels**
+（数据集条目只有 `input_ids`），使模型走不到含 `reasoner_loss` 的合成支路。下一步即把 labels 口径
+按 §108 判据补回训练器并在真实窗口里量 `thinking_head` 的 delta_norm 是否 > 0。
+
+**A98 状态更新**：切分 ✓、解析 ✓、几何 ✓、入批 ✓、物化 ✓、区间绑定 ✓、进优化器 ✓、
+**模型级梯度 ✓（0.049826）**；剩"训练循环内实际更新"一步。A100 关闭。
