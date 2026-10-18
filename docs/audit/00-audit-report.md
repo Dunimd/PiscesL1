@@ -3689,3 +3689,27 @@ A94（服务侧仍按 XML）与 A98 均在册未修；回退后 stage-10 复跑�
    应当合并为一处，而不是让第二个头永远不训练。
 3. 数据侧还没有产出带闭合 span 的文档（M4）；通路已开，语料未跟上。
 4. A94（服务侧仍按 XML 解析工具调用）未动。
+
+
+## §113｜M4 数据侧接上：工具轨迹语料现在带**闭合思考区间**，7144 份文档全部机检通过（2026-10-18）
+
+§112 打开通路后，语料还没有思考区间可监督，本轮补上（`tools/data/tool_trace.py`）：
+
+- 思考内容改为"最终答案之前推导的全部行"（散文与算式都算）。原先用 `_STEP_PATTERN` 把算式行滤掉，
+  实测 400 行样本里 **294 行的 reasoning 为空**——空区间等于不监督，这正是我上一轮把文档写空
+  （`written: 0 / unbalanced: 1592`）暴露出来的真实缺陷，不是计数器噪声。
+- 标记串一律取自 `YvSpecialTokens`（`THINK_OPEN`/`THINK_CLOSE` 模块常量），与 §112 的解析同源；
+  数据形状和运行时标记表因此不可能再各写一份（§89/§104 的既有纪律）。
+- 写出前逐份自检 `_interval_balanced`：起止标记各出现一次且开在前闭在后，不合格计数 `unbalanced` 并丢弃。
+
+**实测**：`--source data/raw/gsm8k_main_train.jsonl` 重建得
+`{"written": 7144, "skipped": 329, "unbalanced": 0}`；取前 40 份过真实读取器
+（`PiscesLxToolsDataJsonSampleReader.extract_text` + `YvTokenizer.encode`），
+**40/40 含标记对**，`_create_reasoning_masks` 合计给出 **4227** 个可监督思考位置——
+这是本仓第一次有语料能喂进 §112 那条通路。
+
+**如实记账**：`data/raw/gsm8k_main_train.jsonl`（parquet 落的 jsonl）与新语料
+`data/corpus_tools/gsm8k_tool_trace_span.jsonl` 是本地产物，尚未上传；三流中仍只有
+`hypothesis` 一条可监督（§112 剩余项 1），`cot_reasoner.thinking_head` 的重复头仍未合并（剩余项 2）；
+A94 服务侧未动。新基线判读要等这批数据真正跑过窗口：现有 CE 8.9261 是**无 span 语料**的基线，
+带 span 的训练曲线不能与它直接比（数据分布变了），下一步按 §101 的三点均值口径重开一条链。

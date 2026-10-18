@@ -50,6 +50,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from utils.dc import PiscesLxLogger
 from utils.paths import PiscesLxPaths
 
+from model.tokenizer.special_tokens import YvSpecialTokens
 from model.multimodal.tool_call_codec import YvToolCallCodec
 
 _LOG = PiscesLxLogger("PiscesLx.Tools.Data",
@@ -69,6 +70,13 @@ CALCULATOR_TOOL = "calculator"
 EXPR_ARGUMENT = "expression"
 
 
+#: The registered thinking markers, taken from the same declaration the tokenizer and the
+#: reasoning engine resolve, so the emitted data shape and the runtime marker table cannot drift
+#: apart (docs/audit/00 section 112).
+THINK_OPEN = YvSpecialTokens.think_token
+THINK_CLOSE = YvSpecialTokens.think_end_token
+
+
 class PiscesLxToolTraceDocument:
     """One synthesized training document plus its bookkeeping."""
 
@@ -79,8 +87,16 @@ class PiscesLxToolTraceDocument:
 
     @property
     def output(self) -> str:
-        """The supervised continuation: reasoning, tool calls, tool answers, conclusion."""
-        return "\n".join(self.reasoning + self.trace)
+        """The supervised continuation: a closed thinking interval, then the tool trace.
+
+        The derivation sits inside the registered marker pair because stream supervision is a
+        closed interval: prose outside it trains the language head only, and an unclosed marker
+        supervises nothing at all (docs/audit/00 section 112).
+        """
+        newline = chr(10)
+        thinking = newline.join(self.reasoning)
+        trace = newline.join(self.trace)
+        return newline.join((THINK_OPEN, thinking, THINK_CLOSE, trace))
 
     def to_sample(self) -> Dict[str, Any]:
         """Schema the training reader consumes as an instruction/output pair."""
@@ -149,7 +165,10 @@ class PiscesLxToolTraceDatasetBuilder:
         body = [line.strip() for line in answer.splitlines() if line.strip()]
         final_index = next((index for index, line in enumerate(body)
                             if line.startswith(_FINAL_MARKER)), len(body))
-        reasoning = [line for line in body[:final_index] if not _STEP_PATTERN.search(line)]
+        # Everything derived before the final answer is the thinking content - prose and
+        # arithmetic alike. Excluding the equation lines left most intervals empty, and an empty
+        # interval carries no supervision at all.
+        reasoning = [line.strip() for line in body[:final_index] if line.strip()]
         steps = cls._steps(answer)
         if not steps:
             return None
@@ -165,6 +184,12 @@ class PiscesLxToolTraceDatasetBuilder:
             trace.append(f"结论：{body[final_index].replace(_FINAL_MARKER, '').strip()}")
         return PiscesLxToolTraceDocument(question.strip(), reasoning, trace)
 
+    @staticmethod
+    def _interval_balanced(text: str) -> bool:
+        """True when the thinking markers each occur once, the opener ahead of the closer."""
+        return (text.count(THINK_OPEN) == 1 and text.count(THINK_CLOSE) == 1
+                and text.index(THINK_OPEN) < text.index(THINK_CLOSE))
+
     def run(self, limit: Optional[int] = None) -> Dict[str, int]:
         """Write the dataset and return build counters; the output is one jsonl file."""
         if not self.source.is_file():
@@ -173,6 +198,7 @@ class PiscesLxToolTraceDatasetBuilder:
 
         written = 0
         skipped = 0
+        unbalanced = 0
         with open(self.source, "r", encoding="utf-8") as reader, \
                 open(self.destination, "w", encoding="utf-8", newline="\n") as writer:
             for line_number, line in enumerate(reader, start=1):
@@ -188,11 +214,14 @@ class PiscesLxToolTraceDatasetBuilder:
                 if document is None:
                     skipped += 1
                     continue
+                if not self._interval_balanced(document.output):
+                    unbalanced += 1
+                    continue
                 writer.write(json.dumps(document.to_sample(), ensure_ascii=False) + "\n")
                 written += 1
                 if line_number % _PROGRESS_EVERY == 0:
                     _LOG.info(f"tool-trace build progress: read={line_number} written={written}")
-        stats = {"written": written, "skipped": skipped}
+        stats = {"written": written, "skipped": skipped, "unbalanced": unbalanced}
         _LOG.info(f"tool-trace dataset built at {self.destination}: {stats}")
         return stats
 
