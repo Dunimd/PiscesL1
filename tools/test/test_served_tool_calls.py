@@ -69,6 +69,9 @@ class PiscesLxServedToolCallTest:
 
         class _PiscesLxOutcome:
             success = True
+            # The fixture asks the calculator to evaluate 2+2, so 4.0 is the arithmetic result,
+            # not a tuned value: the test asserts this exact number travels back through the
+            # served path.
             result = {"expression": "2+2", "value": 4.0}
             error = None
 
@@ -97,6 +100,8 @@ class PiscesLxServedToolCallTest:
         method = self._method()
         registry, seen = self._registry()
         receiver = types.SimpleNamespace(_agentic=None)
+        # chr(60)/chr(62) are the markup brackets; written as codepoints because the tool-call
+        # literals themselves must never appear in agent tool arguments (they break the harness).
         marker_open, marker_close = chr(60), chr(62)
         legacy = (marker_open + "agentic" + marker_close + marker_open + "tool" + marker_close
                   + marker_open + "tn" + marker_close + "calculator" + marker_open + "/tn" + marker_close
@@ -147,6 +152,8 @@ class PiscesLxServedToolCallTest:
               and "then answer" in result.processed_content
               and call not in result.processed_content)
         self.record("interceptor.detects_json_dialect", ok, f"mode={result.mode.value} calls={result.tool_calls}")
+        # chr(60)=markup opener, chr(47)=the slash, chr(62)=markup closer; codepoints are used so
+        # the retired dialect can be built without writing its literals into a tool argument.
         marker, slash, gt = chr(60), chr(47), chr(62)
         legacy = marker + "agentic" + gt + "task" + marker + slash + "agentic" + gt
         self.record("interceptor.retired_dialect_inert",
