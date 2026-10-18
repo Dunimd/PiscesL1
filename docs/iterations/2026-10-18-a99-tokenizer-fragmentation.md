@@ -58,3 +58,66 @@ A98（思考流监督通路断开，见 `docs/audit/00-audit-report.md` §108/§
 
 - A98（思考 span 监督断开）被本条阻塞在最外层；§108/§110 的四点闭合仍然有效，但要在 A99 修好后才可达。
 - A94（服务侧仍按 XML 解析工具调用）与本条无关，仍在册。
+
+## 追加（同日）：第 1 步的假设被实测否证——运行时补注册会**换行**，不能那样修
+
+按上面第 1 步做了一次一次性实验（`AutoTokenizer.from_pretrained('tokenizer', local_files_only=True)`，
+只测不改源码），三条实测：
+
+1. 后端 `vocab_size = 154820`，且 think 起始标记**不在** `tokenizer.vocab` 里
+   （这更正了本文早先"`added_tokens` 的 36 条在 `.vocab` 里查得到、只是不参与切分"的推断——
+   前一次补丁没打印注册日志、也没抛 `TypeError`，真正原因是我当时用了**字典条目**形式，
+   该版本的 `add_tokens` 在 `tokenization_utils_tokenizers.py:728` 只收 `List[str]/AddedToken`，
+   而我的分支逻辑先以"是否已存在于 `.vocab`"判定缺失，判据本身就是错的）。
+2. 用 `[str]` 形式注册有效：`t.add_tokens([think_start], special_tokens=True)` 返回 1，
+   之后 `encode` 从 5 个碎片变成**一个** id；`convert_tokens_to_ids` 同步可查。
+3. **但分到的 id 是 154885，而工件声明的是 154841。** 154885 = 154820 + 65，
+   65 正好是 `tokenizer_config.json` 的 47 条 `extra_special_tokens` 与 `tokenizer.json` 的
+   36 条 `added_tokens` 的**并集大小**（交集实测 18）。也就是说后端把两份名单的并集排在
+   154820 之后自增发号，与 `tokenizer.json` 里**逐条写死的 id 不是同一套坐标**。
+
+**结论（推翻本文第 1 步）**：运行时"补注册 + 断言 id 相等"这条路走不通——断言必然失败；
+若改成"注册后把 embedding 也 resize 到新 id"，则是在给既有 checkpoint 换行，
+会直接冲击已交付链上 `keep_step375_seq256_a95.pt` 的几何一致性（A84 几何闸会拒或更糟：静默错位）。
+
+**因此 A99 的正确战场是工件本身，不是运行时补丁**：必须让
+`tokenizer/tokenizer.json` 的 `added_tokens` 与 `tokenizer/tokenizer_config.json` 的
+`extra_special_tokens` **合并成一套自洽坐标**（同一串、同一 id、顺序与模型 embedding 行数一致），
+并且 `cfg.vocab_size` 由这套坐标**推导**而不是另写。这是一个"数据工件 + 配置"的重建任务，
+必须配套机检：逐条断言"串 → 运行时 id == 工件声明 id == embedding 行号"，
+阳性对照用故意把某条 id 改错。改完仍须按本文第 5 步用 `verify_checkpoint` 证明
+留出集 CE 仍为 8.9261（现行语料不含标记串，普通文本的分词不应受影响）。
+
+本轮**未改任何源码**（实验是一次性脚本，树上无残留），源码净变化仍为零。
+
+## 再追加：两套坐标的**数量账**已经对上，正确修法因此唯一确定
+
+实测四个数（一次读工件，无源码改动）：
+
+```
+added_tokens            36 条   声明 id 区间 154820..154855
+extra_special_tokens    47 条
+交集                    18 条
+并集                    65 条     → 154820 + 65 = 154885 = YvTokenizer.vocab_size = 模型 embedding 行数
+```
+
+这解释了上面第 3 条：后端把**两份名单的并集**自 154820 起顺序发号，一直发到 154884；
+而 `tokenizer.json` 里逐条写死的 154820..154855 是**另一套坐标**，与前者**互相冲突**
+（同一 id 被两套语义占用）。因此：
+
+- **模型的 embedding 行是按并集坐标建的**（154885 行），不是按 `added_tokens` 的声明 id 建的；
+- 上面实验里补注册拿到 154885，是并集之外**再发一个新号**，即**落在不存在的行上**（合法行号 0..154884）——
+  这正是"运行时补丁"绝不能上生产的原因；
+- 唯一自洽的修法是**把工件合成一套坐标**：以并集为准重建
+  `tokenizer.json` 的 `added_tokens` 与 `tokenizer_config.json` 的 `extra_special_tokens`
+  （同一串、同一 id、id 必须 < `cfg.vocab_size`），`cfg.vocab_size` 由这套坐标推导而非另写常量。
+- 机检随做：逐条断言"串 → 运行时 id == 工件声明 id < embedding 行数"，
+  并保留阳性对照（故意把某条 id 改到行号之外或与之冲突，测试必须失败）。
+- 改后判据不变：`verify_checkpoint` 对 `keep_step375_seq256_a95.pt` 的留出集 CE 仍须是 **8.9261**，
+  且普通文本的分词逐 id 不变（现行语料不含标记串，重建坐标不应扰动既有 token 的 id）。
+
+**为什么这必须做在工件层**：A98/A94 与全部标记条件化能力（思考 span、模态标记、工具标记）
+都依赖"标记是一个词元且指向确定的 embedding 行"。坐标不统一时，
+`thinking_head` 的 44% 参数、服务侧的工具执行、数据侧的 span 监督**都无从谈起**——
+这就是本会话从 §108 一路挖到这里的因果链底部。
+
