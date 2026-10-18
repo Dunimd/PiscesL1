@@ -3983,3 +3983,29 @@ A104/A105 仅登记取证，未动代码。
 A104 那条改动（缺 labels 时派生自监督目标）实测后 `thinking_head` 的 delta 仍为 0.000000，
 **已 `git checkout` 回退、未提交**：不拿没拿到效果的改动进历史；A104 仍是 A98 的唯一剩余断点，
 下一步从"训练算子实际反传的标量是哪一个"切入（`_try_sft_operator` 与 `opss/train/sft.py` 的 loss 取值路径）。
+
+
+### §119 再追加（收尾定位）：A104 的表述需要更正——合成与反传都在，断点在 `reasoner_out["loss"]` 的取值
+
+推翻我自己上一段的推断（"reasoner 损失没并进被反传的标量"）：
+
+- `opss/train/sft.py:763` 取的就是 `outputs.get("loss")`；
+- `model/core/model.py:2645` 确实在合成 `loss = lm_loss + reasoner_loss`，其中
+  `reasoner_loss = reasoner_out.get("loss")`，**但带一个静默兜底**：
+  `reasoner_out is None` 或 `reasoner_out.get("loss") is None` 时替换成 `logits.new_zeros(())`。
+
+于是 `thinking_head.delta_norm = 0` 只剩两种可能，且都在这一行之内：
+1. 该分支整体未执行（`reasoner_out` 仍为 `None`）——与"引擎已物化、日志打了 `streams bound`"并不矛盾，
+   因为物化发生在惰性初始化里，而 `reasoner_out` 是否被赋值取决于**该前向是否真的调用引擎**；
+2. 引擎返回的 `loss` 为 `None`，被就地换成零张量——此时监督确实进了图但贡献恒为零。
+
+**下一刀（一次真跑即可判明，不改动源码）**：在真实窗口里打印
+`reasoner_out is None` 与 `reasoner_out.get("loss")` 的数值。两种结果对应两个不同修法：
+前者要把 `self.reasoner(...)` 的调用条件与该分支的实际守卫对齐；后者要查 `_compute_reasoning_loss`
+为何返回 `None`（很可能是 `reasoning_outputs` 的键与 `masks` 的键在真实批次下不重叠）。
+另需一并消除这行的静默兜底：零张量替代必须打日志点名，否则这类"贡献恒为零"的问题下次仍不可见
+——与 §119 里 clamp 静默折叠标记是同一类病。
+
+本轮净改动仅此记录：工作树干净、`E:/pisceslx-artifacts` 2.5GB、旧几何产物已退役到
+`retired-151646-geometry/`。A98 未申报完成：通路七段（切分/解析/几何/入批/物化/区间/进优化器）
+均已实测打通，最后一段"区间损失对梯度有非零贡献"仍未证。
