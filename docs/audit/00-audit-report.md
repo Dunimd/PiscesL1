@@ -4147,3 +4147,22 @@ A100 只把两个头合成一个还不够：**剩下的那个头本身就是 `hi
 是主机内存耗尽而非逻辑错误——崩溃前 delta 已非零，说明被中断的是"继续跑"，不是"能不能训"。
 `0.1B` 档带 span 的链在本机仍不可行，属**资源结论**而非代码结论：需要 T4/启智级别显存/内存，
 这条已并入 P1 的算力前提。
+
+
+### §124 附：其余未标 special 的 added tokens 清单（15 条，代码零消费者）
+
+为"其余 18 条 `special=false`"这条待办取一次实数（改 think 三条之后）：
+`tokenizer.json` 里 `special` 为假的还剩 **15 条**，id 区间 **154838..154855**，内容是
+`<|code_prefix|>` / `<|code_middle|>` / `<|code_suffix|>`、`[tool_call]` / `[/tool_call]` /
+`[tool_response]` / `[/tool_response]`、`[arg_key]` / `[arg_value]` 一族与 `[/nothink]`。
+逐条 grep `model/ tools/ opss/ utils/` 的**代码消费者 = 0**（用原串精确匹配，不用猜）。
+
+结论与口径：
+1. 它们**不影响** A98 与思考流（那三条 think 标记已改为 `special=true` 并实测单词元）；
+2. `tool_call/tool_response/arg_*` 是**已废弃 XML 方言时代**的遗留控制串——现行工具方言是标准 JSON，
+   代码里没人读它们；按"禁功能重叠、除根防复活"的口径，这一族应当**随 A94 的收尾一并从词表声明里删除**，
+   而不是简单翻成 `special=true`（翻成 true 等于把没人用的控制串变成单词元，白占切分优先级）；
+3. `code_prefix/middle/suffix` 若将来做代码补全的三段式监督再启用，届时按 §123 判据先加机检再声明。
+
+因此这条待办的正确处置是"删除声明"，不是"批量改标志"；已并入 A94 收尾与
+`special_tokens.py` 死声明清理同一批（那 17 个零消费者字段与此同源）。
