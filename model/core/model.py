@@ -1373,6 +1373,15 @@ class YvModel(nn.Module):
                 if marker_id is not None:
                     resolved.add(int(marker_id))
         self._reasoning_marker_cache = frozenset(resolved)
+        # An empty set here disables span supervision for the whole run, so it has to be said out
+        # loud rather than discovered through a checkpoint with no thinking head in it.
+        if not resolved:
+            _LOG.warning(
+                "Reasoner markers resolved to nothing through "
+                f"{type(tokenizer).__name__}: the thinking stream cannot be supervised this run."
+            )
+        else:
+            _LOG.info(f"Reasoner markers resolved: {sorted(resolved)}")
         return self._reasoning_marker_cache
 
     def bind_tokenizer(self, tokenizer) -> None:

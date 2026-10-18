@@ -20,7 +20,7 @@
 
 version: "{{VERSION}}"
 model_type: piscesl1_7b
-vocab_size: 151646
+vocab_size: 154885
 hidden_size: 3584
 n_layer: 28
 n_head: 32

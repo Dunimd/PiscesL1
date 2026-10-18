@@ -3874,3 +3874,38 @@ labels 是在算子内部由 `input_ids.clone()` 造出来的，模型侧从来�
 
 若 B 成立，修法是让 clamp 以 `cfg.vocab_size`（模型行数）为准而不是后端词表数——那本身就是分词器与模型
 词表口径不一致的又一处症状，与 §117 的 `special` 标志同源。
+
+
+## §119｜A102（原 A98 最后一层）根因：模型预设 vocab_size=151646 < 分词器 id 空间 154885，越界 id 被 clamp 静默折叠；修好后真实训练首次物化 reasoner
+
+**根因与量化**：12 个 `configs/model/*.yaml` 都声明 `vocab_size: 151646`，而分词器 id 空间是
+**154885**（后端 154820 + 并集 65）。差 **3239 行**，且**全部 65 个特殊标记（模态/工具/思考）都在缺口里**。
+`tools/train/core.py` 的 `_prepare_model_batch` 又把越界 id `clamp(0, embed行数-1)`，于是这些标记在模型侧
+**被静默折成第 151645 行**——这才是 §117 两次真跑"门控走到、标记解析正常、`torch.isin` 却不命中"的原因。
+
+实测影响面（60 篇/语料）：wikitext 最大 id **147936**、越界 **0** ⇒ §106/§116 的 CE 8.9261 基线**未被污染，仍有效**；
+`gsm8k_tool_trace_span` 最大 id **154842**、越界 **464** ⇒ 凡带控制标记的语料（思考 span、工具调用、模态标记）
+在模型侧**此前一律不可表示**。这一条比 A98 更根本，登记为 **A102**。
+
+**修法（本轮已落）**：12 个预设的 `vocab_size` 一律抬到 **154885**（与分词器 id 空间对齐，由 `YvTokenizer().vocab_size` 读出后写死为配置值，非代码常量）；
+另在 `YvModel._reasoning_marker_ids()` 把"解析为空"从静默改为 WARNING、解析成功打 INFO——正是这行新日志
+证明门控确实被走到，从而把嫌疑精确收敛到几何缺口。
+
+**链级首次正结果（真跑，不续旧点）**：`--model_size 0.01B --seq_len 256 --max_steps 2`
+→ `TRAIN_EXIT=0`、无 Traceback；产物 `global_step=2`、
+`materialized_components=['block_field','crv','long_context','mtp_heads','reasoner']`、
+张量数 **582 → 740**、`thinking_head` 键 **4 个**（`reasoner.cot_reasoner.thinking_head.weight/bias` 等）；
+`logs/Yv/Reasoner/output.log` 出现 `streams bound to marker intervals: ['hypothesis']`。
+
+**如实留下的半条（下一步第一件事）**：优化器条目 515 / 状态张量 389 与修前**完全相同**，
+即 reasoner 是在优化器建立之后才物化的，**"被保存"尚不等于"被更新"**——这正是 §48/§21 时代
+`ensure_all_modules 全仓无人调用`的老账在新路径上复现。判据已备好：连续两次窗口比对
+`thinking_head.weight` 是否变化（或直接把 reasoner 参数纳入优化器参数组）。在拿到这条之前，
+A98 只能记为"通路已开、监督已进入损失，但权重是否移动未证"。
+
+**连带后果（必须声明）**：预设几何变化后，`keep_step375_seq256_a95.pt` 等旧点与新配置的 embedding
+行数不一致，A84 几何闸会**正确拒绝**直接续训；链要按新几何重开基线，§101 的三点均值判读口径随之重算。
+这是修正确认缺陷的必然代价，不是回归。
+
+待办同批补齐：clamp 由静默改为计数告警（它掩盖了本次根因）、新增 stage-10 契约测试
+"每个预设的 vocab_size >= 分词器 id 空间"并带阳性对照（故意调低必失败）。A100/A94/A101 状态不变。

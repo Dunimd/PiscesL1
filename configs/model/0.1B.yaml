@@ -31,7 +31,7 @@ version: "{{VERSION}}"
 # size and the declared block count are therefore set to the largest values that leave
 # headroom for gradients, optimiser state and the checkpoint write on this machine.
 model_type: piscesl1_0.1b
-vocab_size: 151646
+vocab_size: 154885
 # Host tier measured on this machine: with hidden 512 / 2 layers / Ink 8-bit states the
 # pipeline's first step left 1.30 GB of commit charge and the second step died with a
 # native allocation failure. Halving the width (same architecture, same mechanism switches,
