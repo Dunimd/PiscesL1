@@ -3964,3 +3964,22 @@ reasoner.multi_path_core.thinking_head.bias     delta_norm=0.000000
 
 本轮净改动：`tools/train/core.py` 的 `_adopt_lazy_parameters` 与其调用点（已按 A103 数字验证，故提交）；
 A104/A105 仅登记取证，未动代码。
+
+
+### §119 再追加（同日）：旧几何产物已退役，基线改按 154885 重开
+
+按用户指示清理干扰项。`E:/pisceslx-artifacts` 从 **24 GB 降到 2.5 GB**：
+
+- **25 个旧几何产物（16 GB）移入** `E:/pisceslx-artifacts/retired-151646-geometry/`（含 `keep_step375_seq256_a95.pt`、`keep_step250/275/300/325/350`、`det_*.pt`），
+  可回退、不删除；目录内写了 `README.txt` 说明"这些权重的 65 个控制标记全部塌缩在第 151645 行、
+  与修正后的预设几何不一致、几何闸会拒绝，**不得 `--resume_ckpt`**"，只作为审计里既有数字的历史证据保留。
+- 删除的只有我自己的调试窗口与残留：`adopt/ adopt2/ spans2/3/5/6/7/9/ ab_off/ chain128/ tools_run/`。
+  保留 `spans8/`（§119 首个链上正结果：reasoner 物化、740 张量、4 个 thinking_head 键）与 `tokbak/`（分词器工件备份，含 `pre-special` 版本）。
+
+**基线口径随之更正**：CE **8.9261** 仍是**旧链在纯文本上的有效读数**（wikitext 最大 id 147936，未越界，
+不受塌缩影响），但它不再是新几何下的对照锚点——新链从 `E:/pisceslx-artifacts/ckpt/` 起算，
+按 §101 的三点均值判读重开。`verify_checkpoint` 用于旧点时会因几何不一致被正确拒绝，这是预期行为。
+
+A104 那条改动（缺 labels 时派生自监督目标）实测后 `thinking_head` 的 delta 仍为 0.000000，
+**已 `git checkout` 回退、未提交**：不拿没拿到效果的改动进历史；A104 仍是 A98 的唯一剩余断点，
+下一步从"训练算子实际反传的标量是哪一个"切入（`_try_sft_operator` 与 `opss/train/sft.py` 的 loss 取值路径）。
