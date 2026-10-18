@@ -153,3 +153,37 @@ extra_special_tokens    47 条
 凡"根因在工件层"这类结论，必须先在**已还原的工件**上逐条用原串复测，再决定动不动工件。
 本轮实际净改动：仅这份记录的更正；分词器与工件均无残留改动。
 
+
+
+## 决策（自主定，不再请示）：不动 embedding 几何；A98 需要的是**掩码构造的设计改动**，不是换标记
+
+A99(a)(b) 已提交（`c7c8fbb`）：标记解析改为后端权威，think 起止与 `/nothink` 现在都能经
+`get_special_token_id` 拿到工件声明的 id（154841 / 154842 / 154851），47 条全部解出、`unresolved=0`。
+
+在此基础上再做一次读码，得到**新的阻断点**（因此单流绑定不能只改标记表）：
+`_create_reasoning_masks`（`model/reasoning/reasoner/multipath_core.py:718-740`）的语义是
+**"下一个流的起点就是本流的终点"**——hypothesis 区间由 `start_hypothesis` 开始、由 `start_evidence` 结束。
+若只把 `start_hypothesis` / `hypothesis_merge` 绑到 think 起止一对，
+`hypothesis` 掩码会从起始标记一路为真直到序列末尾（`start_evidence` 仍是词表尾部整数，永不触发），
+于是 stream CE 会把**非思考内容**也当思考流监督——这不是"少监督一点"，而是**监督错对象**。
+
+**采用的方案（明确取舍）**：不扩词表、不动 `cfg.vocab_size` 与 embedding 行几何（保住链上
+`keep_step375_seq256_a95.pt` 与 CE 8.9261 基线），把掩码构造改为**成对区间**语义：
+
+1. `reasoning_tokens` 改为声明**区间**而非"下一个起点即终点"：每项是 `(start_id, end_id)`，
+   think 起止一对定义 `hypothesis` 区间；`evidence` / `conclusion` 在词表没有对应成对标记时
+   **显式为空**（不返回掩码），由 `_compute_reasoning_loss` 自然跳过，绝不用词表尾部整数冒充标记。
+2. 标记串一律取自 `YvSpecialTokens`（唯一事实来源），id 一律经 `get_special_token_id` 解析；
+   解析不到的流记录为未监督并 WARNING 点名——延续 A99 的"禁止静默错值"。
+3. `unified.py:424-427` 改为使用真 `input_ids`（已证该替换是错的）；`model.py` 侧需要一个
+   tokenizer 绑定通路（`YvModel` 现在**没有** `tokenizer` 属性，这是 §110 第 1 条实测的 consequence），
+   由训练器在建模后注入，模型不自己造分词器。
+4. 前向门控由"批次是否含已绑定标记"驱动（`has_reasoning_span`），不新增旗标。
+5. 判据（缺一项就不算修好）：同一份带 think 区间的文档过模型，
+   `span_mask.any()` 为真**且**区间止于闭合标记、`thinking_head` 的 `.grad is not None`；
+   阴性对照：把闭合标记去掉，`hypothesis` 掩码必须**不**延伸到序列末尾（即成对语义生效）；
+   `test_reasoner_shapes.py:127` 目前仍**期望**没有流内 CE，接入时一并翻转该期望；
+   最后 `manage.py test --stage 10` 全绿 + `verify_checkpoint` 复现 CE 8.9261（无 span 的现行语料
+   必须逐位不受影响）。
+
+本轮源码零改动（工作树干净），只落这份口径。下一轮按 1→5 执行；A94（服务侧仍 XML）紧随其后。
