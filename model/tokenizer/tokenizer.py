@@ -266,6 +266,50 @@ class YvTokenizer:
             "the engine must not depend on any external model asset."
         )
 
+    def resolve_token_id(self, token: str):
+        """Resolve a special-token string to its single runtime id.
+
+        The vocabulary artefact's `added_tokens` are authoritative at the backend level, but this
+        class historically read its table from `tokenizer_config.json` only, which left correctly
+        registered markers unresolvable through the public API. Order of resolution therefore goes
+        backend-first: added tokens, then the model vocabulary, then a strictly single-token encode.
+
+        Args:
+            token (str): The special-token string to resolve.
+
+        Returns:
+            Optional[int]: The id when the backend recognises ``token`` as exactly one token;
+                ``None`` otherwise. Never returns a fragment's id.
+        """
+        added = getattr(self._tokenizer, 'get_added_vocab', None)
+        if callable(added):
+            table = added() or {}
+            if token in table:
+                return int(table[token])
+        vocab = getattr(self._tokenizer, 'vocab', None)
+        if isinstance(vocab, dict) and token in vocab:
+            return int(vocab[token])
+        to_id = getattr(self._tokenizer, 'convert_tokens_to_ids', None)
+        if callable(to_id):
+            try:
+                candidate = to_id(token)
+            except (RuntimeError, ValueError, TypeError, AttributeError):
+                candidate = None
+            if candidate is not None and int(candidate) >= 0 and candidate != getattr(
+                self._tokenizer, 'unk_token_id', None
+            ):
+                return int(candidate)
+        if not hasattr(self._tokenizer, 'encode'):
+            return None
+        try:
+            ids = self._tokenizer.encode(token, add_special_tokens=False)
+        except (RuntimeError, ValueError, TypeError, AttributeError):
+            return None
+        if isinstance(ids, dict):
+            ids = ids.get('input_ids', [])
+        ids = list(ids)
+        return int(ids[0]) if len(ids) == 1 else None
+
     def _prepare_special_tokens(self) -> None:
         """Prepare special token mappings from tokenizer_config.json.
 
@@ -288,16 +332,29 @@ class YvTokenizer:
             _LOG.warning("No special tokens found in tokenizer_config.json, using empty list")
             return
 
+        unresolved = []
         for token in glmtokens:
-            if hasattr(self._tokenizer, 'vocab') and token in self._tokenizer.vocab:
-                self._multimodal_token_ids[token] = self._tokenizer.vocab[token]
-            elif hasattr(self._tokenizer, 'encode'):
-                try:
-                    ids = self._tokenizer.encode(token, add_special_tokens=False)
-                    if ids:
-                        self._multimodal_token_ids[token] = ids[0]
-                except (RuntimeError, ValueError, TypeError, AttributeError) as e:
-                    raise RuntimeError(f"Failed to encode special token {token}: {e}") from e
+            token_id = self.resolve_token_id(token)
+            if token_id is None:
+                # A declared marker the backend does not recognise as one token is recorded
+                # nowhere. Storing `encode(token)[0]` instead - what this used to do - writes a
+                # subword fragment's id into the table, so every consumer addresses the wrong
+                # embedding row while believing it holds the marker (docs/iterations/2026-10-18-a99).
+                unresolved.append(token)
+                continue
+            self._multimodal_token_ids[token] = token_id
+
+        self.unresolved_special_tokens = tuple(unresolved)
+        if unresolved:
+            _LOG.warning(
+                f"{len(unresolved)} declared special tokens are not registered as single tokens "
+                f"in the vocabulary artefact and were left unmapped: {unresolved}. Markers listed "
+                f"here cannot appear in data until tokenizer/tokenizer.json declares them."
+            )
+        _LOG.info(
+            f"Prepared {len(self._multimodal_token_ids)} special tokens "
+            f"({len(glmtokens)} declared, {len(unresolved)} unmapped)"
+        )
 
         _LOG.info(f"Prepared {len(self._multimodal_token_ids)} special tokens")
 
@@ -478,7 +535,13 @@ class YvTokenizer:
             >>> tokenizer = YvTokenizer()
             >>> img_pad_id = tokenizer.get_special_token_id("<|image_pad|>")
         """
-        return self._multimodal_token_ids.get(token)
+        mapped = self._multimodal_token_ids.get(token)
+        if mapped is not None:
+            return int(mapped)
+        # The table above is built from tokenizer_config.json's list only, so a marker that
+        # the artefact registers correctly (tokenizer.json's added_tokens) used to be
+        # unresolvable through this public API. Ask the backend instead of reporting None.
+        return self.resolve_token_id(token)
 
     def apply_chat_template(
         self,
