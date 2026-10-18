@@ -87,16 +87,17 @@ class PiscesLxToolTraceDocument:
 
     @property
     def output(self) -> str:
-        """The supervised continuation: a closed thinking interval, then the tool trace.
+        """The supervised continuation: one closed thinking interval per derivation step.
 
-        The derivation sits inside the registered marker pair because stream supervision is a
-        closed interval: prose outside it trains the language head only, and an unclosed marker
-        supervises nothing at all (docs/audit/00 section 112).
+        Stream supervision is a closed interval, so a single pair wrapped around the whole
+        solution put the closer hundreds of tokens away - a fixed-length training window then saw
+        an opener with no closer and supervised nothing at all (docs/audit/00 section 117).
+        Per-step intervals stay closed under truncation and bind each thought to its own step.
         """
         newline = chr(10)
-        thinking = newline.join(self.reasoning)
+        closed = [newline.join((THINK_OPEN, line, THINK_CLOSE)) for line in self.reasoning]
         trace = newline.join(self.trace)
-        return newline.join((THINK_OPEN, thinking, THINK_CLOSE, trace))
+        return newline.join(closed + [trace])
 
     def to_sample(self) -> Dict[str, Any]:
         """Schema the training reader consumes as an instruction/output pair."""
@@ -186,9 +187,27 @@ class PiscesLxToolTraceDatasetBuilder:
 
     @staticmethod
     def _interval_balanced(text: str) -> bool:
-        """True when the thinking markers each occur once, the opener ahead of the closer."""
-        return (text.count(THINK_OPEN) == 1 and text.count(THINK_CLOSE) == 1
-                and text.index(THINK_OPEN) < text.index(THINK_CLOSE))
+        """True when every opener is closed later, with at least one complete interval.
+
+        The retired single-interval check demanded exactly one pair, which no longer describes the
+        emitted shape; nesting is verified by depth so an interleaved or unclosed document fails.
+        """
+        depth = 0
+        index = 0
+        pairs = 0
+        while index < len(text):
+            if text.startswith(THINK_OPEN, index):
+                depth += 1
+                index += len(THINK_OPEN)
+            elif text.startswith(THINK_CLOSE, index):
+                if depth == 0:
+                    return False
+                depth -= 1
+                pairs += 1
+                index += len(THINK_CLOSE)
+            else:
+                index += 1
+        return depth == 0 and pairs >= 1
 
     def run(self, limit: Optional[int] = None) -> Dict[str, int]:
         """Write the dataset and return build counters; the output is one jsonl file."""
