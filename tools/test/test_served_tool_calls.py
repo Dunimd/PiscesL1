@@ -129,11 +129,37 @@ class PiscesLxServedToolCallTest:
         self.record("served.malformed_not_executed", seen == [] and updated == broken,
                     f"registry saw {seen}")
 
+    def check_interceptor_detects_json_dialect(self) -> None:
+        """The served interceptor must see the shipped dialect and nothing else.
+
+        Its seven retired-dialect regexes matched nothing, so every real model output read as
+        "no agent activity" - a silently blind gate in front of the served path. Detection now
+        shares the codec, which is only provable by feeding it a codec-rendered document.
+        """
+        from tools.infer.agent_interceptor import PiscesLxAgentInterceptor, PiscesLxAgentMode
+        interceptor = PiscesLxAgentInterceptor()
+        call = YvToolCallCodec.render([("calculator", {"expression": "2+2"})])
+        result = interceptor.intercept("compute please " + call + " then answer")
+        ok = (result.mode is PiscesLxAgentMode.TOOL_CALL
+              and result.tool_calls == [{"name": "calculator",
+                                         "parameters": {"expression": "2+2"}}]
+              and "compute please" in result.processed_content
+              and "then answer" in result.processed_content
+              and call not in result.processed_content)
+        self.record("interceptor.detects_json_dialect", ok, f"mode={result.mode.value} calls={result.tool_calls}")
+        marker, slash, gt = chr(60), chr(47), chr(62)
+        legacy = marker + "agentic" + gt + "task" + marker + slash + "agentic" + gt
+        self.record("interceptor.retired_dialect_inert",
+                    interceptor.intercept(legacy).mode is PiscesLxAgentMode.NONE
+                    and not interceptor.has_agent_pattern(legacy),
+                    "the deleted markup detects nothing")
+
     def run(self) -> int:
         for check in (self.check_json_dialect_executes,
                       self.check_retired_dialect_is_not_executed,
                       self.check_plain_text_passes_through,
-                      self.check_malformed_document_is_reported_not_guessed):
+                      self.check_malformed_document_is_reported_not_guessed,
+                      self.check_interceptor_detects_json_dialect):
             try:
                 check()
             except Exception as exc:
