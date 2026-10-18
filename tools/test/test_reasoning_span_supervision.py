@@ -58,19 +58,19 @@ SEQ = 16
 FILLER = list(range(100, 100 + SEQ))
 
 
-def fixture(ids):
-    """Build a [1, seq] id tensor from the filler, overwriting the given positions."""
-    values = list(FILLER[: SEQ])
-    for position, value in ids:
-        values[position] = value
-    return torch.tensor([values], dtype=torch.long)
-
-
 class PiscesLxReasoningSpanTest:
     """Assert marker resolution and closed-interval span supervision hold."""
 
     def __init__(self) -> None:
         self.results: list = []
+
+    @staticmethod
+    def fixture(ids):
+        """Build a [1, seq] id tensor from the filler, overwriting the given positions."""
+        values = list(FILLER[: SEQ])
+        for position, value in ids:
+            values[position] = value
+        return torch.tensor([values], dtype=torch.long)
 
     def record(self, name: str, ok: bool, detail: str) -> None:
         self.results.append((name, ok, detail))
@@ -128,7 +128,7 @@ class PiscesLxReasoningSpanTest:
         engine = self._engine(tokenizer)
         start_id, end_id = engine.reasoning_intervals["hypothesis"]
         #   marker  at positions 2 and 8 -> supervision must cover 3..7 only.
-        input_ids = fixture([(2, start_id), (8, end_id)])
+        input_ids = self.fixture([(2, start_id), (8, end_id)])
         masks = engine._create_reasoning_masks(input_ids)
         row = masks.get("hypothesis")
         inside = (row is not None and bool(row[0, 3:8].all())
@@ -141,7 +141,7 @@ class PiscesLxReasoningSpanTest:
         tokenizer = YvTokenizer()
         engine = self._engine(tokenizer)
         start_id, _ = engine.reasoning_intervals["hypothesis"]
-        input_ids = fixture([(0, start_id)])
+        input_ids = self.fixture([(0, start_id)])
         masks = engine._create_reasoning_masks(input_ids)
         self.record("span.unclosed_supervises_nothing", "hypothesis" not in masks,
                     f"mask keys for an unclosed span: {sorted(masks)}")
@@ -150,9 +150,9 @@ class PiscesLxReasoningSpanTest:
         """Without a marker the stream path stays closed, so pretraining text pays nothing."""
         tokenizer = YvTokenizer()
         engine = self._engine(tokenizer)
-        plain = fixture([])
+        plain = self.fixture([])
         start_id, end_id = engine.reasoning_intervals["hypothesis"]
-        spanned = fixture([(0, start_id), (SEQ - 2, end_id)])
+        spanned = self.fixture([(0, start_id), (SEQ - 2, end_id)])
         self.record("span.plain_batch_has_no_span",
                     not engine.has_reasoning_span(plain) and not engine._create_reasoning_masks(plain),
                     "plain ids trigger neither detection nor a mask")

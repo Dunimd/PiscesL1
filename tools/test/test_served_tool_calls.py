@@ -67,14 +67,14 @@ class PiscesLxServedToolCallTest:
         """A registry stub that records every execution request."""
         seen: list = []
 
-        class _Outcome:
+        class _PiscesLxOutcome:
             success = True
             result = {"expression": "2+2", "value": 4.0}
             error = None
 
         async def execute(name, parameters):
             seen.append((name, dict(parameters)))
-            return _Outcome()
+            return _PiscesLxOutcome()
 
         return types.SimpleNamespace(execute=execute), seen
 
